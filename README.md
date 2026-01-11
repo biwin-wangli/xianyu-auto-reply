@@ -1337,25 +1337,6 @@ docker run -d -p 8080:8080 --restart always \
   -v $PWD/xianyu-auto-reply/:/app/data/ \
   --name xianyu-auto-reply \
   zhinianblog/xianyu-auto-reply:latest
-  
-
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t your-username/xianyu-auto-reply:latest \
-  -t your-username/xianyu-auto-reply:2.2.0 \
-  --push \
-  .
-  
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t wangli648438/xianyu-auto-reply:latest \
-  --push \
-  . 
-  
-docker run -d -p 8083:8080 --restart always \
-  -v /opt/1panel/apps/xianyu-auto-reply/:/app/data/ \
-  --name xianyu-auto-reply \
-  wangli648438/xianyu-auto-reply:latest
 ```
 
 **验证多架构镜像**：

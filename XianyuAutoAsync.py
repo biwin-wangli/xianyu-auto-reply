@@ -493,6 +493,17 @@ class XianyuLive:
             if expired_deliveries:
                 cleaned_total += len(expired_deliveries)
                 logger.warning(f"【{self.cookie_id}】清理了 {len(expired_deliveries)} 个过期发货记录")
+
+            # 清理过期的已发货记录（与发货冷却保持一致）
+            expired_sent_orders = [
+                order_id for order_id, sent_time in self.delivery_sent_orders.items()
+                if current_time - sent_time > max_delivery_age
+            ]
+            for order_id in expired_sent_orders:
+                del self.delivery_sent_orders[order_id]
+            if expired_sent_orders:
+                cleaned_total += len(expired_sent_orders)
+                logger.warning(f"【{self.cookie_id}】清理了 {len(expired_sent_orders)} 个已发货记录")
             
             # 清理过期的订单确认记录（保留30分钟内的）
             max_confirm_age = 1800  # 30分钟
@@ -509,7 +520,9 @@ class XianyuLive:
             # 只有实际清理了内容才记录总数日志
             if cleaned_total > 0:
                 logger.info(f"【{self.cookie_id}】实例缓存清理完成，共清理 {cleaned_total} 条记录")
-                logger.warning(f"【{self.cookie_id}】当前缓存数量 - 通知: {len(self.last_notification_time)}, 发货: {len(self.last_delivery_time)}, 确认: {len(self.confirmed_orders)}")
+                logger.warning(
+                    f"【{self.cookie_id}】当前缓存数量 - 通知: {len(self.last_notification_time)}, 发货: {len(self.last_delivery_time)}, 已发货: {len(self.delivery_sent_orders)}, 确认: {len(self.confirmed_orders)}"
+                )
         
         except Exception as e:
             logger.error(f"【{self.cookie_id}】清理实例缓存时出错: {self._safe_str(e)}")
@@ -680,8 +693,8 @@ class XianyuLive:
         self.confirmed_orders = {}  # 记录已确认发货的订单，防止重复确认
         self.order_confirm_cooldown = 600  # 10分钟内不重复确认同一订单
 
-        # 自动发货已发送订单记录
-        self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
+        # 自动发货已发送订单记录（存时间戳便于清理）
+        self.delivery_sent_orders = {}  # {order_id: timestamp}
 
         self.session = None  # 用于API调用的aiohttp session
 
@@ -823,7 +836,10 @@ class XianyuLive:
 
     def mark_delivery_sent(self, order_id: str):
         """标记订单已发货"""
-        self.delivery_sent_orders.add(order_id)
+        current_time = time.time()
+        self.delivery_sent_orders[order_id] = current_time
+        # 同步更新冷却时间记录，避免重复发货
+        self.last_delivery_time[order_id] = current_time
         logger.info(f"【{self.cookie_id}】订单 {order_id} 已标记为发货")
         
         # 更新订单状态为已发货
@@ -864,16 +880,27 @@ class XianyuLive:
             await asyncio.sleep(delay_seconds)
 
             # 检查锁是否仍然存在且需要释放
-            if lock_key in self._lock_hold_info:
-                lock_info = self._lock_hold_info[lock_key]
+            lock_info = self._lock_hold_info.get(lock_key)
+            if lock_info:
+                current_task = asyncio.current_task()
+                lock_task = lock_info.get('task')
+                if lock_task is not None and lock_task is not current_task:
+                    logger.info(f"【{self.cookie_id}】订单锁 {lock_key} 延迟释放被新任务接管，跳过清理")
+                    return
+
                 if lock_info.get('locked', False):
                     # 释放锁
                     lock_info['locked'] = False
                     lock_info['release_time'] = time.time()
                     logger.info(f"【{self.cookie_id}】订单锁 {lock_key} 延迟释放完成")
 
-                    # 清理锁信息（可选，也可以保留用于统计）
-                    # del self._lock_hold_info[lock_key]
+                # 清理锁信息与关联结构，避免内存增长
+                lock_info['task'] = None
+                self._lock_hold_info.pop(lock_key, None)
+                self._lock_usage_times.pop(lock_key, None)
+                order_lock = self._order_locks.get(lock_key)
+                if order_lock and not order_lock.locked():
+                    self._order_locks.pop(lock_key, None)
 
         except asyncio.CancelledError:
             logger.info(f"【{self.cookie_id}】订单锁 {lock_key} 延迟释放任务被取消")
@@ -4442,6 +4469,7 @@ class XianyuLive:
                                 spec_value=spec_value,
                                 quantity=quantity,
                                 amount=amount,
+                                order_status='processing',
                                 cookie_id=self.cookie_id
                             )
                             
@@ -7472,7 +7500,7 @@ class XianyuLive:
                 item_id = f"auto_{user_id}_{int(time.time())}"
             # 处理订单状态消息
             try:
-                logger.info(message)
+                logger.info(f"【{self.cookie_id}】🔍 完整消息结构: {message}")
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
                 # 安全地检查订单状态

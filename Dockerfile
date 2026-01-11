@@ -109,6 +109,9 @@ RUN apt-get update && \
         libxfixes3 \
         xdg-utils \
         chromium \
+        xvfb \
+        x11vnc \
+        fluxbox \
         # OpenCV运行时依赖
         libgl1 \
         libglib2.0-0 \
