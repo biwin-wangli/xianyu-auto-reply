@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -51,6 +51,336 @@ security = HTTPBearer(auto_error=False)
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
+
+# ========================= 防暴力破解配置 =========================
+# IP 登录失败记录: {ip: {'attempts': int, 'first_attempt': float, 'last_attempt': float, 'blocked_until': float}}
+login_ip_tracker = {}
+# 用户名登录失败记录: {username: {'attempts': int, 'first_attempt': float, 'last_attempt': float, 'locked_until': float}}
+login_user_tracker = {}
+# 永久黑名单IP列表
+ip_blacklist = set()
+
+# 验证码存储: {captcha_id: {'code': str, 'created_at': float, 'ip': str}}
+captcha_storage = {}
+CAPTCHA_EXPIRE_SECONDS = 300  # 验证码5分钟过期
+CAPTCHA_REQUIRE_AFTER_FAILURES = 2  # 失败2次后要求验证码
+
+# 防暴力破解参数
+BRUTE_FORCE_CONFIG = {
+    'ip_max_attempts': 5,           # 单IP最大尝试次数
+    'ip_window_seconds': 300,       # IP计数窗口时间（5分钟）
+    'ip_block_seconds': 1800,       # IP封禁时间（30分钟）
+    'user_max_attempts': 10,        # 单用户名最大尝试次数
+    'user_window_seconds': 600,     # 用户名计数窗口时间（10分钟）
+    'user_lock_seconds': 3600,      # 用户名锁定时间（1小时）
+    'auto_blacklist_threshold': 20, # 自动加入永久黑名单的失败次数阈值
+    'response_delay_base': 1,       # 基础响应延迟（秒）
+    'response_delay_multiplier': 0.5,  # 每次失败增加的延迟（秒）
+    'max_response_delay': 10,       # 最大响应延迟（秒）
+    'captcha_require_failures': 2,  # 失败多少次后需要验证码
+}
+
+
+def cleanup_login_trackers():
+    """清理过期的登录追踪记录"""
+    current_time = time.time()
+    
+    # 清理IP追踪记录
+    expired_ips = []
+    for ip, data in login_ip_tracker.items():
+        # 如果封禁已过期且超出窗口时间，则清理
+        if data.get('blocked_until', 0) < current_time:
+            if current_time - data.get('last_attempt', 0) > BRUTE_FORCE_CONFIG['ip_window_seconds'] * 2:
+                expired_ips.append(ip)
+    for ip in expired_ips:
+        del login_ip_tracker[ip]
+    
+    # 清理用户名追踪记录
+    expired_users = []
+    for username, data in login_user_tracker.items():
+        if data.get('locked_until', 0) < current_time:
+            if current_time - data.get('last_attempt', 0) > BRUTE_FORCE_CONFIG['user_window_seconds'] * 2:
+                expired_users.append(username)
+    for username in expired_users:
+        del login_user_tracker[username]
+
+
+def check_ip_blocked(client_ip: str) -> tuple[bool, str, int]:
+    """
+    检查IP是否被封禁
+    返回: (是否封禁, 原因, 剩余封禁秒数)
+    """
+    # 检查永久黑名单
+    if client_ip in ip_blacklist:
+        return True, "IP已被永久封禁", -1
+    
+    current_time = time.time()
+    
+    if client_ip in login_ip_tracker:
+        data = login_ip_tracker[client_ip]
+        
+        # 检查是否在封禁期内
+        if data.get('blocked_until', 0) > current_time:
+            remaining = int(data['blocked_until'] - current_time)
+            return True, f"IP登录失败次数过多，请{remaining}秒后再试", remaining
+        
+        # 检查窗口内的失败次数
+        if current_time - data.get('first_attempt', 0) <= BRUTE_FORCE_CONFIG['ip_window_seconds']:
+            if data.get('attempts', 0) >= BRUTE_FORCE_CONFIG['ip_max_attempts']:
+                # 触发封禁
+                block_duration = BRUTE_FORCE_CONFIG['ip_block_seconds']
+                data['blocked_until'] = current_time + block_duration
+                logger.warning(f"🚫 IP {client_ip} 登录失败{data['attempts']}次，封禁{block_duration}秒")
+                return True, f"登录失败次数过多，请{block_duration}秒后再试", block_duration
+    
+    return False, "", 0
+
+
+def check_user_locked(username: str) -> tuple[bool, str, int]:
+    """
+    检查用户名是否被锁定
+    返回: (是否锁定, 原因, 剩余锁定秒数)
+    """
+    current_time = time.time()
+    
+    if username in login_user_tracker:
+        data = login_user_tracker[username]
+        
+        # 检查是否在锁定期内
+        if data.get('locked_until', 0) > current_time:
+            remaining = int(data['locked_until'] - current_time)
+            return True, f"账户已被临时锁定，请{remaining}秒后再试", remaining
+        
+        # 检查窗口内的失败次数
+        if current_time - data.get('first_attempt', 0) <= BRUTE_FORCE_CONFIG['user_window_seconds']:
+            if data.get('attempts', 0) >= BRUTE_FORCE_CONFIG['user_max_attempts']:
+                # 触发锁定
+                lock_duration = BRUTE_FORCE_CONFIG['user_lock_seconds']
+                data['locked_until'] = current_time + lock_duration
+                logger.warning(f"🔒 用户 {username} 登录失败{data['attempts']}次，锁定{lock_duration}秒")
+                return True, f"账户登录失败次数过多，已被临时锁定，请{lock_duration}秒后再试", lock_duration
+    
+    return False, "", 0
+
+
+def record_login_failure(client_ip: str, username: str):
+    """记录登录失败"""
+    current_time = time.time()
+    
+    # 更新IP记录
+    if client_ip not in login_ip_tracker:
+        login_ip_tracker[client_ip] = {
+            'attempts': 0,
+            'first_attempt': current_time,
+            'last_attempt': current_time,
+            'blocked_until': 0
+        }
+    
+    ip_data = login_ip_tracker[client_ip]
+    
+    # 如果超出窗口时间，重置计数
+    if current_time - ip_data['first_attempt'] > BRUTE_FORCE_CONFIG['ip_window_seconds']:
+        ip_data['attempts'] = 0
+        ip_data['first_attempt'] = current_time
+    
+    ip_data['attempts'] += 1
+    ip_data['last_attempt'] = current_time
+    
+    # 检查是否需要加入永久黑名单
+    if ip_data['attempts'] >= BRUTE_FORCE_CONFIG['auto_blacklist_threshold']:
+        ip_blacklist.add(client_ip)
+        logger.error(f"⛔ IP {client_ip} 登录失败{ip_data['attempts']}次，已加入永久黑名单！")
+    
+    # 更新用户名记录
+    if username:
+        if username not in login_user_tracker:
+            login_user_tracker[username] = {
+                'attempts': 0,
+                'first_attempt': current_time,
+                'last_attempt': current_time,
+                'locked_until': 0
+            }
+        
+        user_data = login_user_tracker[username]
+        
+        # 如果超出窗口时间，重置计数
+        if current_time - user_data['first_attempt'] > BRUTE_FORCE_CONFIG['user_window_seconds']:
+            user_data['attempts'] = 0
+            user_data['first_attempt'] = current_time
+        
+        user_data['attempts'] += 1
+        user_data['last_attempt'] = current_time
+
+
+def record_login_success(client_ip: str, username: str):
+    """记录登录成功，重置计数"""
+    if client_ip in login_ip_tracker:
+        login_ip_tracker[client_ip]['attempts'] = 0
+    if username and username in login_user_tracker:
+        login_user_tracker[username]['attempts'] = 0
+
+
+def get_response_delay(client_ip: str) -> float:
+    """计算响应延迟时间（失败次数越多，延迟越长）"""
+    if client_ip not in login_ip_tracker:
+        return 0
+    
+    attempts = login_ip_tracker[client_ip].get('attempts', 0)
+    if attempts <= 1:
+        return 0
+    
+    delay = BRUTE_FORCE_CONFIG['response_delay_base'] + \
+            (attempts - 1) * BRUTE_FORCE_CONFIG['response_delay_multiplier']
+    return min(delay, BRUTE_FORCE_CONFIG['max_response_delay'])
+
+
+def is_captcha_required(client_ip: str) -> bool:
+    """检查是否需要验证码"""
+    if client_ip not in login_ip_tracker:
+        return False
+    attempts = login_ip_tracker[client_ip].get('attempts', 0)
+    return attempts >= BRUTE_FORCE_CONFIG.get('captcha_require_failures', 2)
+
+
+def generate_captcha_image(code: str) -> bytes:
+    """生成验证码图片"""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    import random
+    
+    # 图片尺寸
+    width, height = 150, 50
+    
+    # 创建图片
+    image = Image.new('RGB', (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    
+    # 添加干扰线
+    for _ in range(5):
+        x1 = random.randint(0, width)
+        y1 = random.randint(0, height)
+        x2 = random.randint(0, width)
+        y2 = random.randint(0, height)
+        draw.line([(x1, y1), (x2, y2)], fill=(random.randint(100, 200), random.randint(100, 200), random.randint(100, 200)), width=1)
+    
+    # 添加干扰点
+    for _ in range(50):
+        x = random.randint(0, width)
+        y = random.randint(0, height)
+        draw.point((x, y), fill=(random.randint(0, 150), random.randint(0, 150), random.randint(0, 150)))
+    
+    # 尝试加载字体，如果失败则使用默认字体
+    font = None
+    font_paths = [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/ARIALBD.TTF", 
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    
+    for font_path in font_paths:
+        try:
+            font = ImageFont.truetype(font_path, 32)
+            break
+        except:
+            continue
+    
+    if font is None:
+        # 使用默认字体
+        font = ImageFont.load_default()
+    
+    # 绘制验证码字符
+    colors = [
+        (0, 0, 139),      # 深蓝
+        (139, 0, 0),      # 深红
+        (0, 100, 0),      # 深绿
+        (139, 69, 19),    # 棕色
+        (75, 0, 130),     # 靛蓝
+    ]
+    
+    x_offset = 15
+    for i, char in enumerate(code):
+        # 随机颜色
+        color = random.choice(colors)
+        # 随机角度（-15到15度）
+        angle = random.randint(-15, 15)
+        
+        # 创建单个字符的图片用于旋转
+        char_image = Image.new('RGBA', (35, 45), (255, 255, 255, 0))
+        char_draw = ImageDraw.Draw(char_image)
+        char_draw.text((5, 5), char, font=font, fill=color)
+        
+        # 旋转
+        char_image = char_image.rotate(angle, expand=False, fillcolor=(255, 255, 255, 0))
+        
+        # 粘贴到主图
+        y_offset = random.randint(2, 10)
+        image.paste(char_image, (x_offset, y_offset), char_image)
+        x_offset += 28
+    
+    # 添加轻微模糊
+    image = image.filter(ImageFilter.SMOOTH)
+    
+    # 转换为bytes
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def generate_captcha_code(length: int = 4) -> str:
+    """生成验证码字符串（排除容易混淆的字符）"""
+    # 排除 0, O, 1, I, l 等容易混淆的字符
+    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
+
+def cleanup_expired_captchas():
+    """清理过期的验证码"""
+    current_time = time.time()
+    expired = [cid for cid, data in captcha_storage.items() 
+               if current_time - data['created_at'] > CAPTCHA_EXPIRE_SECONDS]
+    for cid in expired:
+        del captcha_storage[cid]
+
+
+def verify_login_captcha(captcha_id: str, captcha_code: str, client_ip: str) -> tuple[bool, str]:
+    """
+    验证登录验证码
+    返回: (是否验证成功, 错误消息)
+    """
+    if not captcha_id or not captcha_code:
+        return False, "请输入验证码"
+    
+    if captcha_id not in captcha_storage:
+        return False, "验证码已过期，请刷新"
+    
+    captcha_data = captcha_storage[captcha_id]
+    
+    # 检查是否过期
+    if time.time() - captcha_data['created_at'] > CAPTCHA_EXPIRE_SECONDS:
+        del captcha_storage[captcha_id]
+        return False, "验证码已过期，请刷新"
+    
+    # 检查IP是否匹配（防止验证码被其他IP使用）
+    if captcha_data.get('ip') and captcha_data['ip'] != client_ip:
+        return False, "验证码无效，请刷新"
+    
+    # 验证码比较（忽略大小写）
+    if captcha_code.upper() != captcha_data['code'].upper():
+        return False, "验证码错误"
+    
+    # 验证成功后删除验证码（一次性使用）
+    del captcha_storage[captcha_id]
+    return True, ""
+
+
+def get_ip_failure_count(client_ip: str) -> int:
+    """获取IP的登录失败次数"""
+    if client_ip not in login_ip_tracker:
+        return 0
+    return login_ip_tracker[client_ip].get('attempts', 0)
+
 
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
@@ -115,6 +445,8 @@ class LoginRequest(BaseModel):
     password: Optional[str] = None
     email: Optional[str] = None
     verification_code: Optional[str] = None
+    captcha_id: Optional[str] = None      # 验证码ID
+    captcha_code: Optional[str] = None    # 用户输入的验证码
 
 
 class LoginResponse(BaseModel):
@@ -124,6 +456,7 @@ class LoginResponse(BaseModel):
     user_id: Optional[int] = None
     username: Optional[str] = None
     is_admin: Optional[bool] = None
+    captcha_required: Optional[bool] = None  # 是否需要验证码
 
 
 class ChangePasswordRequest(BaseModel):
@@ -332,12 +665,27 @@ logger.info("Web服务器启动，文件日志收集器已初始化")
 async def log_requests(request, call_next):
     start_time = time.time()
 
-    logger.info(f"🌐 API请求: {request.method} {request.url.path}")
+    # 获取用户信息
+    user_info = "未登录"
+    try:
+        # 从请求头中获取Authorization
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            if token in SESSION_TOKENS:
+                token_data = SESSION_TOKENS[token]
+                # 检查token是否过期
+                if time.time() - token_data['timestamp'] <= TOKEN_EXPIRE_TIME:
+                    user_info = f"【{token_data['username']}#{token_data['user_id']}】"
+    except Exception:
+        pass
+
+    logger.info(f"🌐 {user_info} API请求: {request.method} {request.url.path}")
 
     response = await call_next(request)
 
     process_time = time.time() - start_time
-    logger.info(f"✅ API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
+    logger.info(f"✅ {user_info} API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
 
     return response
 
@@ -515,18 +863,69 @@ async def register_route():
 
 # 登录接口
 @app.post('/login')
-async def login(request: LoginRequest):
+async def login(login_request: LoginRequest, request: Request):
     from db_manager import db_manager
+    
+    # 获取客户端IP（考虑代理）
+    client_ip = request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or \
+                request.headers.get('X-Real-IP', '') or \
+                request.client.host if request.client else 'unknown'
+    
+    # 定期清理过期记录
+    cleanup_login_trackers()
+    
+    # 检查IP是否被封禁
+    ip_blocked, ip_block_reason, ip_remaining = check_ip_blocked(client_ip)
+    if ip_blocked:
+        logger.warning(f"🚫 IP {client_ip} 尝试登录但已被封禁: {ip_block_reason}")
+        return LoginResponse(
+            success=False,
+            message=ip_block_reason
+        )
+    
+    # 获取登录标识（用户名或邮箱）
+    login_identifier = login_request.username or login_request.email or ''
+    
+    # 检查用户名是否被锁定
+    if login_identifier:
+        user_locked, user_lock_reason, user_remaining = check_user_locked(login_identifier)
+        if user_locked:
+            logger.warning(f"🔒 用户 {login_identifier} 尝试登录但账户已锁定 (IP: {client_ip})")
+            # 即使锁定也要记录IP的尝试
+            record_login_failure(client_ip, login_identifier)
+            return LoginResponse(
+                success=False,
+                message=user_lock_reason,
+                captcha_required=True
+            )
+    
+    # 每次登录都需要验证码
+    captcha_valid, captcha_error = verify_login_captcha(
+        login_request.captcha_id,
+        login_request.captcha_code,
+        client_ip
+    )
+    if not captcha_valid:
+        logger.warning(f"🔢 IP {client_ip} 验证码验证失败: {captcha_error}")
+        return LoginResponse(
+            success=False,
+            message=captcha_error,
+            captcha_required=True
+        )
+    logger.info(f"🔢 IP {client_ip} 验证码验证成功")
 
     # 判断登录方式
-    if request.username and request.password:
+    if login_request.username and login_request.password:
         # 用户名/密码登录
-        logger.info(f"【{request.username}】尝试用户名登录")
+        logger.info(f"【{login_request.username}】尝试用户名登录 (IP: {client_ip})")
 
         # 统一使用用户表验证（包括admin用户）
-        if db_manager.verify_user_password(request.username, request.password):
-            user = db_manager.get_user_by_username(request.username)
+        if db_manager.verify_user_password(login_request.username, login_request.password):
+            user = db_manager.get_user_by_username(login_request.username)
             if user:
+                # 登录成功，重置计数
+                record_login_success(client_ip, login_request.username)
+                
                 # 生成token
                 token = generate_token()
                 SESSION_TOKENS[token] = {
@@ -538,9 +937,9 @@ async def login(request: LoginRequest):
 
                 # 区分管理员和普通用户的日志
                 if user['username'] == ADMIN_USERNAME:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
+                    logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）(IP: {client_ip})")
                 else:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功")
+                    logger.info(f"【{user['username']}#{user['id']}】登录成功 (IP: {client_ip})")
 
                 return LoginResponse(
                     success=True,
@@ -551,18 +950,30 @@ async def login(request: LoginRequest):
                     is_admin=(user['username'] == ADMIN_USERNAME)
                 )
 
-        logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
+        # 登录失败，记录失败次数
+        record_login_failure(client_ip, login_request.username)
+        
+        # 计算响应延迟（防止快速暴力破解）
+        delay = get_response_delay(client_ip)
+        if delay > 0:
+            logger.info(f"🐢 IP {client_ip} 登录失败，延迟响应 {delay:.1f} 秒")
+            await asyncio.sleep(delay)
+        
+        logger.warning(f"【{login_request.username}】登录失败：用户名或密码错误 (IP: {client_ip})")
         return LoginResponse(
             success=False,
             message="用户名或密码错误"
         )
 
-    elif request.email and request.password:
+    elif login_request.email and login_request.password:
         # 邮箱/密码登录
-        logger.info(f"【{request.email}】尝试邮箱密码登录")
+        logger.info(f"【{login_request.email}】尝试邮箱密码登录 (IP: {client_ip})")
 
-        user = db_manager.get_user_by_email(request.email)
-        if user and db_manager.verify_user_password(user['username'], request.password):
+        user = db_manager.get_user_by_email(login_request.email)
+        if user and db_manager.verify_user_password(user['username'], login_request.password):
+            # 登录成功，重置计数
+            record_login_success(client_ip, login_request.email)
+            
             # 生成token
             token = generate_token()
             SESSION_TOKENS[token] = {
@@ -572,7 +983,7 @@ async def login(request: LoginRequest):
                 'timestamp': time.time()
             }
 
-            logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
+            logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功 (IP: {client_ip})")
 
             return LoginResponse(
                 success=True,
@@ -583,33 +994,50 @@ async def login(request: LoginRequest):
                 is_admin=(user['username'] == ADMIN_USERNAME)
             )
 
-        logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
+        # 登录失败，记录失败次数
+        record_login_failure(client_ip, login_request.email)
+        
+        # 计算响应延迟
+        delay = get_response_delay(client_ip)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        
+        logger.warning(f"【{login_request.email}】邮箱登录失败：邮箱或密码错误 (IP: {client_ip})")
         return LoginResponse(
             success=False,
             message="邮箱或密码错误"
         )
 
-    elif request.email and request.verification_code:
+    elif login_request.email and login_request.verification_code:
         # 邮箱/验证码登录
-        logger.info(f"【{request.email}】尝试邮箱验证码登录")
+        logger.info(f"【{login_request.email}】尝试邮箱验证码登录 (IP: {client_ip})")
 
         # 验证邮箱验证码
-        if not db_manager.verify_email_code(request.email, request.verification_code, 'login'):
-            logger.warning(f"【{request.email}】验证码登录失败：验证码错误或已过期")
+        if not db_manager.verify_email_code(login_request.email, login_request.verification_code, 'login'):
+            # 验证码错误也记录失败
+            record_login_failure(client_ip, login_request.email)
+            delay = get_response_delay(client_ip)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            
+            logger.warning(f"【{login_request.email}】验证码登录失败：验证码错误或已过期 (IP: {client_ip})")
             return LoginResponse(
                 success=False,
                 message="验证码错误或已过期"
             )
 
         # 获取用户信息
-        user = db_manager.get_user_by_email(request.email)
+        user = db_manager.get_user_by_email(login_request.email)
         if not user:
-            logger.warning(f"【{request.email}】验证码登录失败：用户不存在")
+            logger.warning(f"【{login_request.email}】验证码登录失败：用户不存在 (IP: {client_ip})")
             return LoginResponse(
                 success=False,
                 message="用户不存在"
             )
 
+        # 登录成功，重置计数
+        record_login_success(client_ip, login_request.email)
+        
         # 生成token
         token = generate_token()
         SESSION_TOKENS[token] = {
@@ -619,7 +1047,7 @@ async def login(request: LoginRequest):
             'timestamp': time.time()
         }
 
-        logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
+        logger.info(f"【{user['username']}#{user['id']}】验证码登录成功 (IP: {client_ip})")
 
         return LoginResponse(
             success=True,
@@ -656,6 +1084,129 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
     if credentials and credentials.credentials in SESSION_TOKENS:
         del SESSION_TOKENS[credentials.credentials]
     return {"message": "已登出"}
+
+
+# ========================= 防暴力破解管理API =========================
+
+@app.get('/admin/security/login-stats')
+async def get_login_security_stats(admin_user: Dict[str, Any] = Depends(verify_admin_token)):
+    """获取登录安全统计信息（仅管理员）"""
+    current_time = time.time()
+    
+    # 统计IP封禁信息
+    blocked_ips = []
+    for ip, data in login_ip_tracker.items():
+        if data.get('blocked_until', 0) > current_time:
+            blocked_ips.append({
+                'ip': ip,
+                'attempts': data.get('attempts', 0),
+                'blocked_until': data.get('blocked_until', 0),
+                'remaining_seconds': int(data['blocked_until'] - current_time)
+            })
+    
+    # 统计用户锁定信息
+    locked_users = []
+    for username, data in login_user_tracker.items():
+        if data.get('locked_until', 0) > current_time:
+            locked_users.append({
+                'username': username,
+                'attempts': data.get('attempts', 0),
+                'locked_until': data.get('locked_until', 0),
+                'remaining_seconds': int(data['locked_until'] - current_time)
+            })
+    
+    # 最近失败的IP
+    recent_failed_ips = []
+    for ip, data in login_ip_tracker.items():
+        if data.get('attempts', 0) > 0:
+            recent_failed_ips.append({
+                'ip': ip,
+                'attempts': data.get('attempts', 0),
+                'last_attempt': data.get('last_attempt', 0)
+            })
+    recent_failed_ips.sort(key=lambda x: x['last_attempt'], reverse=True)
+    
+    return {
+        'success': True,
+        'data': {
+            'blocked_ips': blocked_ips,
+            'blocked_ip_count': len(blocked_ips),
+            'locked_users': locked_users,
+            'locked_user_count': len(locked_users),
+            'blacklisted_ips': list(ip_blacklist),
+            'blacklist_count': len(ip_blacklist),
+            'recent_failed_ips': recent_failed_ips[:20],  # 最近20个
+            'config': BRUTE_FORCE_CONFIG
+        }
+    }
+
+
+@app.post('/admin/security/unblock-ip/{ip}')
+async def unblock_ip(ip: str, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
+    """解除IP封禁（仅管理员）"""
+    unblocked = False
+    
+    # 从临时封禁中移除
+    if ip in login_ip_tracker:
+        login_ip_tracker[ip]['blocked_until'] = 0
+        login_ip_tracker[ip]['attempts'] = 0
+        unblocked = True
+        logger.info(f"🔓 管理员 {admin_user['username']} 解除了IP {ip} 的临时封禁")
+    
+    # 从永久黑名单中移除
+    if ip in ip_blacklist:
+        ip_blacklist.discard(ip)
+        unblocked = True
+        logger.info(f"🔓 管理员 {admin_user['username']} 将IP {ip} 从永久黑名单中移除")
+    
+    if unblocked:
+        return {'success': True, 'message': f'IP {ip} 已解除封禁'}
+    else:
+        return {'success': False, 'message': f'IP {ip} 未在封禁列表中'}
+
+
+@app.post('/admin/security/unlock-user/{username}')
+async def unlock_user(username: str, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
+    """解除用户锁定（仅管理员）"""
+    if username in login_user_tracker:
+        login_user_tracker[username]['locked_until'] = 0
+        login_user_tracker[username]['attempts'] = 0
+        logger.info(f"🔓 管理员 {admin_user['username']} 解除了用户 {username} 的锁定")
+        return {'success': True, 'message': f'用户 {username} 已解除锁定'}
+    else:
+        return {'success': False, 'message': f'用户 {username} 未在锁定列表中'}
+
+
+@app.post('/admin/security/blacklist-ip/{ip}')
+async def add_ip_to_blacklist(ip: str, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
+    """将IP加入永久黑名单（仅管理员）"""
+    ip_blacklist.add(ip)
+    logger.warning(f"⛔ 管理员 {admin_user['username']} 将IP {ip} 加入永久黑名单")
+    return {'success': True, 'message': f'IP {ip} 已加入永久黑名单'}
+
+
+@app.post('/admin/security/update-config')
+async def update_brute_force_config(
+    config: Dict[str, Any],
+    admin_user: Dict[str, Any] = Depends(verify_admin_token)
+):
+    """更新防暴力破解配置（仅管理员）"""
+    valid_keys = set(BRUTE_FORCE_CONFIG.keys())
+    updated = []
+    
+    for key, value in config.items():
+        if key in valid_keys and isinstance(value, (int, float)):
+            BRUTE_FORCE_CONFIG[key] = value
+            updated.append(key)
+    
+    if updated:
+        logger.info(f"⚙️ 管理员 {admin_user['username']} 更新了防暴力破解配置: {updated}")
+        return {'success': True, 'message': f'已更新配置: {updated}', 'config': BRUTE_FORCE_CONFIG}
+    else:
+        return {'success': False, 'message': '没有有效的配置项被更新'}
+
+
+# ========================= 防暴力破解管理API结束 =========================
 
 
 # 修改管理员密码接口
@@ -1209,7 +1760,7 @@ async def send_message_api(request: SendMessageRequest):
                 )
 
         # 直接获取XianyuLive实例，跳过cookie_manager检查
-        from XianyuAutoAsync import XianyuLive
+        from XianyuAutoAsync import XianyuLive, ConnectionState
         live_instance = XianyuLive.get_instance(cleaned_cookie_id)
 
         if not live_instance:
@@ -1219,12 +1770,21 @@ async def send_message_api(request: SendMessageRequest):
                 message="账号实例不存在或未连接，请检查账号状态"
             )
 
-        # 检查WebSocket连接状态
-        if not live_instance.ws or live_instance.ws.closed:
-            logger.warning(f"账号WebSocket连接已断开: {cleaned_cookie_id}")
+        # 检查WebSocket连接状态（使用connection_state作为主要判断依据）
+        # connection_state 是项目维护的连接状态，比 ws.closed 更可靠
+        if live_instance.connection_state != ConnectionState.CONNECTED:
+            logger.warning(f"账号WebSocket连接状态异常: {cleaned_cookie_id}, 状态: {live_instance.connection_state}")
             return SendMessageResponse(
                 success=False,
-                message="账号WebSocket连接已断开，请等待重连"
+                message=f"账号WebSocket连接状态异常({live_instance.connection_state.value})，请等待重连"
+            )
+        
+        # 额外检查ws对象是否存在
+        if not live_instance.ws:
+            logger.warning(f"账号WebSocket对象不存在: {cleaned_cookie_id}")
+            return SendMessageResponse(
+                success=False,
+                message="账号WebSocket连接未就绪，请等待重连"
             )
 
         # 发送消息（使用清理后的所有参数）
@@ -1374,6 +1934,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     for cookie_id, cookie_value in user_cookies.items():
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
+        auto_comment = db_manager.get_auto_comment(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
@@ -1383,6 +1944,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'value': cookie_value,
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
+            'auto_comment': auto_comment,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
         })
@@ -3110,6 +3672,22 @@ class AutoConfirmUpdate(BaseModel):
     auto_confirm: bool
 
 
+class AutoCommentUpdate(BaseModel):
+    auto_comment: bool
+
+
+class CommentTemplateCreate(BaseModel):
+    name: str
+    content: str
+    is_active: Optional[bool] = False
+
+
+class CommentTemplateUpdate(BaseModel):
+    name: Optional[str] = None
+    content: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
 class RemarkUpdate(BaseModel):
     remark: str
 
@@ -3171,6 +3749,212 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
         return {
             "auto_confirm": auto_confirm,
             "message": f"自动确认发货当前{'开启' if auto_confirm else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 自动好评相关API ====================
+
+@app.put("/cookies/{cid}/auto-comment")
+def update_auto_comment(cid: str, update_data: AutoCommentUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号的自动好评设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 更新数据库中的auto_comment设置
+        success = db_manager.update_auto_comment(cid, update_data.auto_comment)
+        if not success:
+            raise HTTPException(status_code=500, detail="更新自动好评设置失败")
+
+        return {
+            "msg": "success",
+            "auto_comment": update_data.auto_comment,
+            "message": f"自动好评已{'开启' if update_data.auto_comment else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/auto-comment")
+def get_auto_comment(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号的自动好评设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        # 获取auto_comment设置
+        auto_comment = db_manager.get_auto_comment(cid)
+        return {
+            "auto_comment": auto_comment,
+            "message": f"自动好评当前{'开启' if auto_comment else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/comment-templates")
+def get_comment_templates(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号的好评模板列表"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        templates = db_manager.get_comment_templates(cid)
+        return {
+            "templates": templates,
+            "message": "获取好评模板列表成功"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cookies/{cid}/comment-templates")
+def add_comment_template(cid: str, template_data: CommentTemplateCreate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """添加好评模板"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        template_id = db_manager.add_comment_template(
+            cid, 
+            template_data.name, 
+            template_data.content, 
+            template_data.is_active
+        )
+        if template_id is None:
+            raise HTTPException(status_code=500, detail="添加好评模板失败")
+
+        return {
+            "msg": "success",
+            "template_id": template_id,
+            "message": "添加好评模板成功"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/cookies/{cid}/comment-templates/{template_id}")
+def update_comment_template(cid: str, template_id: int, template_data: CommentTemplateUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新好评模板"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.update_comment_template(
+            template_id,
+            name=template_data.name,
+            content=template_data.content,
+            is_active=template_data.is_active
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="更新好评模板失败")
+
+        return {
+            "msg": "success",
+            "message": "更新好评模板成功"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/cookies/{cid}/comment-templates/{template_id}")
+def delete_comment_template(cid: str, template_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除好评模板"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.delete_comment_template(template_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="删除好评模板失败")
+
+        return {
+            "msg": "success",
+            "message": "删除好评模板成功"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/cookies/{cid}/comment-templates/{template_id}/activate")
+def activate_comment_template(cid: str, template_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """激活指定的好评模板"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        # 检查cookie是否属于当前用户
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.set_active_comment_template(cid, template_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="激活好评模板失败")
+
+        return {
+            "msg": "success",
+            "message": "激活好评模板成功"
         }
     except HTTPException:
         raise
@@ -3358,7 +4142,8 @@ def get_keywords_with_item_id(cid: str, current_user: Dict[str, Any] = Depends(g
             "reply": keyword_data['reply'],
             "item_id": keyword_data['item_id'] or "",
             "type": keyword_data['type'],
-            "image_url": keyword_data['image_url']
+            "image_url": keyword_data['image_url'],
+            "item_title": keyword_data.get('item_title', '')  # 添加商品名称
         })
 
     return result

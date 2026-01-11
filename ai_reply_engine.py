@@ -1,19 +1,15 @@
 """
-AI回复引擎模块
-集成XianyuAutoAgent的AI回复功能到现有项目中
+AI回复引擎模块 - 统一意图识别与回复生成
 
-【P0/P1 最小化修改版】
-- 修复 P1-1 (高成本): detect_intent 改为本地关键词
-- 修复 P0-2 (部署陷阱): 移除客户端缓存，实现无状态
-- 修复 P1-3 (健壮性): 增强 Gemini 消息格式化
-- 遵照指示，未修复 P0-1 (议价竞争条件)
+【重构版本】
+- 将意图判断和回复生成合并为一次AI调用
+- AI根据完整上下文自行判断意图并生成回复
+- 避免关键词误判导致的不当回复
 """
 
-import os
 import json
 import time
-import sqlite3
-import requests  # 确保已导入
+import requests
 import threading
 from typing import List, Dict, Optional
 from loguru import logger
@@ -22,80 +18,108 @@ from db_manager import db_manager
 
 
 class AIReplyEngine:
-    """AI回复引擎"""
+    """AI回复引擎 - 统一意图识别与回复生成"""
     
     def __init__(self):
-        # 修复 P0-2: 移除有状态的缓存，以支持多进程部署
-        # self.clients = {}  # 已移除
-        # self.agents = {}   # 已移除
-        # self.client_last_used = {}  # 已移除
         self._init_default_prompts()
         # 用于控制同一chat_id消息的串行处理
         self._chat_locks = {}
         self._chat_locks_lock = threading.Lock()
     
     def _init_default_prompts(self):
-        """初始化默认提示词"""
+        """初始化默认提示词（用于构建统一提示词）"""
         self.default_prompts = {
-            'classify': '''你是一个意图分类专家...（此提示词已不再被 detect_intent 使用）''',
+            'price': '''【议价场景】
+策略：根据议价次数递减优惠
+- 第1次：可小幅优惠，表达诚意
+- 第2次：中等优惠，强调已是优惠价
+- 第3次及以后：最大优惠或坚持底线
+语气友好但坚定，突出商品价值和优势。''',
             
-            'price': '''你是一位经验丰富的销售专家，擅长议价。
-语言要求：简短直接，每句≤10字，总字数≤40字。
-议价策略：
-1. 根据议价次数递减优惠：第1次小幅优惠，第2次中等优惠，第3次最大优惠
-2. 接近最大议价轮数时要坚持底线，强调商品价值
-3. 优惠不能超过设定的最大百分比和金额
-4. 语气要友好但坚定，突出商品优势
-注意：结合商品信息、对话历史和议价设置，给出合适的回复。''',
+            'tech': '''【技术/产品问题】
+基于商品信息回答，不要自行发挥。
+如果问题超出商品信息范围，回复："等等，这个我需要看一看"''',
             
-            'tech': '''你是一位技术专家，专业解答产品相关问题。
-语言要求：简短专业，每句≤10字，总字数≤40字。
-回答重点：产品功能、使用方法、注意事项。
-注意：基于商品信息回答，避免过度承诺。''',
-            
-            'default': '''你是一位资深电商卖家，提供优质客服。
-语言要求：简短友好，每句≤10字，总字数≤40字。
-回答重点：商品介绍、物流、售后等常见问题。
-注意：结合商品信息，给出实用建议。'''
+            'default': '''【一般咨询】
+基于商品信息回答物流、售后等问题。
+如果问题超出商品信息范围，回复："等等，这个我需要看一看"
+如果客户明确询问退款，回复："虚拟产品，一旦发出是不可以退款的"'''
         }
     
     def _create_openai_client(self, cookie_id: str) -> Optional[OpenAI]:
-        """
-        (原 get_client) 创建指定账号的OpenAI客户端
-        修复 P0-2: 移除了缓存逻辑，以支持多进程无状态部署
-        """
+        """创建指定账号的OpenAI客户端（无状态）"""
         settings = db_manager.get_ai_reply_settings(cookie_id)
         if not settings['ai_enabled'] or not settings['api_key']:
             return None
         
         try:
-            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
+            logger.info(f"创建OpenAI客户端: base_url={settings['base_url']}")
             client = OpenAI(
                 api_key=settings['api_key'],
                 base_url=settings['base_url']
             )
-            logger.info(f"为账号 {cookie_id} 创建OpenAI客户端成功，实际base_url: {client.base_url}")
             return client
         except Exception as e:
             logger.error(f"创建OpenAI客户端失败 {cookie_id}: {e}")
             return None
 
     def _is_dashscope_api(self, settings: dict) -> bool:
-        """判断是否为DashScope API - 只有选择自定义模型时才使用"""
+        """判断是否为DashScope API"""
         model_name = settings.get('model_name', '')
         base_url = settings.get('base_url', '')
-
         is_custom_model = model_name.lower() in ['custom', '自定义', 'dashscope', 'qwen-custom']
         is_dashscope_url = 'dashscope.aliyuncs.com' in base_url
-
-        logger.info(f"API类型判断: model_name={model_name}, is_custom_model={is_custom_model}, is_dashscope_url={is_dashscope_url}")
-
         return is_custom_model and is_dashscope_url
 
     def _is_gemini_api(self, settings: dict) -> bool:
-        """判断是否为Gemini API (通过模型名称)"""
+        """判断是否为Gemini API"""
         model_name = settings.get('model_name', '').lower()
         return 'gemini' in model_name
+    
+    def _build_unified_system_prompt(self, custom_prompts: dict, settings: dict) -> str:
+        """
+        构建统一的系统提示词
+        将意图判断和回复生成整合到一个提示词中
+        """
+        # 获取各场景的指导（优先使用用户自定义）
+        price_guide = custom_prompts.get('price', self.default_prompts['price'])
+        tech_guide = custom_prompts.get('tech', self.default_prompts['tech'])
+        default_guide = custom_prompts.get('default', self.default_prompts['default'])
+        
+        # 获取议价设置
+        max_bargain_rounds = settings.get('max_bargain_rounds', 3)
+        max_discount_percent = settings.get('max_discount_percent', 10)
+        max_discount_amount = settings.get('max_discount_amount', 100)
+        
+        unified_prompt = f"""你是一位专业的电商客服AI助手。请根据用户消息和上下文，直接生成合适的回复。
+
+## 核心原则
+1. **准确理解意图**：只根据用户实际说的内容判断，不要过度解读
+2. **不要主动提及敏感话题**：用户没提到的（如退款、砍价）不要主动提
+3. **基于商品信息回答**：只回答商品信息中有的内容
+4. **避免重复**：结合对话历史，不要重复之前说过的话
+5. **语言简洁友好**：回复要自然、简短，尽量别超过20个字
+
+## 场景处理指南
+
+### 当用户明确要求降价/优惠/砍价时
+{price_guide}
+- 议价限制：最多{max_bargain_rounds}轮，最大优惠{max_discount_percent}%或{max_discount_amount}元
+
+### 当用户询问产品技术/功能/使用问题时
+{tech_guide}
+
+### 其他一般咨询（物流、售后、商品介绍等）
+{default_guide}
+
+## 特别注意
+- 用户只是问价格≠用户在砍价，正常回答价格即可
+- 用户咨询售后≠用户要退款，正常解答即可
+- 如果用户的问题超过你的回答范围，比如发图片，可以说"等等，这个问题我需要看看"，不要自己回答
+
+请直接输出回复内容，不要输出分析过程。"""
+        
+        return unified_prompt
 
     def _call_dashscope_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """调用DashScope API"""
@@ -221,66 +245,18 @@ class AIReplyEngine:
 
     def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """调用OpenAI兼容API"""
-        try:
-            logger.info(f"调用OpenAI API: model={settings['model_name']}, base_url={settings.get('base_url', 'default')}")
-            response = client.chat.completions.create(
-                model=settings['model_name'],
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"OpenAI API调用失败: {e}")
-            # 如果有详细的错误信息，打印出来
-            if hasattr(e, 'response'):
-                logger.error(f"响应状态码: {getattr(e.response, 'status_code', 'unknown')}")
-                logger.error(f"响应内容: {getattr(e.response, 'text', 'unknown')}")
-            raise
+        response = client.chat.completions.create(
+            model=settings['model_name'],
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+        return response.choices[0].message.content.strip()
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
         """检查指定账号是否启用AI回复"""
         settings = db_manager.get_ai_reply_settings(cookie_id)
         return settings['ai_enabled']
-    
-    def detect_intent(self, message: str, cookie_id: str) -> str:
-        """
-        检测用户消息意图 (基于关键词的本地检测)
-        修复 P1-1: 移除了AI调用，以降低成本和延迟。
-        """
-        try:
-            # 检查AI是否启用，如果未启用，不应执行任何AI相关逻辑
-            # 注意：此检查在 generate_reply 的开头已经做过，但保留此处作为第二道防线
-            settings = db_manager.get_ai_reply_settings(cookie_id)
-            if not settings['ai_enabled']:
-                return 'default'
-
-            msg_lower = message.lower()
-
-            # 价格相关关键词
-            price_keywords = [
-                '便宜', '优惠', '刀', '降价', '包邮', '价格', '多少钱', '能少', '还能', '最低', '底价',
-                '实诚价', '到100', '能到', '包个邮', '给个价', '什么价' # <-- 增加这些“口语化”的词
-            ]
-            
-            # 同样，你也可以通过正则表达式来匹配纯数字，比如 "100" "80"
-            # 但那可能有点复杂，先加关键词是最小改动
-            if any(kw in msg_lower for kw in price_keywords):
-                logger.debug(f"本地意图检测: price ({message})")
-                return 'price'
-
-            # 技术相关关键词
-            tech_keywords = ['怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动']
-            if any(kw in msg_lower for kw in tech_keywords):
-                logger.debug(f"本地意图检测: tech ({message})")
-                return 'tech'
-            
-            logger.debug(f"本地意图检测: default ({message})")
-            return 'default'
-        
-        except Exception as e:
-            logger.error(f"本地意图检测失败 {cookie_id}: {e}")
-            return 'default'
     
     def _get_chat_lock(self, chat_id: str) -> threading.Lock:
         """获取指定chat_id的锁，如果不存在则创建"""
@@ -292,130 +268,112 @@ class AIReplyEngine:
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
                       skip_wait: bool = False) -> Optional[str]:
-        """生成AI回复"""
+        """
+        生成AI回复 - 统一意图识别与回复生成
+        AI会自动判断用户意图并生成合适的回复，避免关键词误判
+        """
         if not self.is_ai_enabled(cookie_id):
             return None
         
         try:
-            # 先检测意图（用于后续保存）
-            intent = self.detect_intent(message, cookie_id)
-            logger.info(f"检测到意图: {intent} (账号: {cookie_id})")
+            # 先保存用户消息到数据库（意图暂时设为None，后续可根据需要更新）
+            message_created_at = self.save_conversation(
+                chat_id, cookie_id, user_id, item_id, "user", message, intent=None
+            )
             
-            # 在锁外先保存用户消息到数据库，让所有消息都能立即保存
-            message_created_at = self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
-            
-            # 如果调用方已经实现了去抖（debounce），可以通过 skip_wait=True 跳过内部等待
+            # 消息去抖处理
             if not skip_wait:
-                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息: {message[:20]}... (时间:{message_created_at})")
-                # 固定等待10秒，等待可能的后续消息（在锁外延迟，避免阻塞其他消息保存）
+                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息: {message[:20]}...")
                 time.sleep(10)
             else:
-                logger.info(f"【{cookie_id}】消息已保存（外部防抖已启用，跳过内部等待）: {message[:20]}... (时间:{message_created_at})")
+                logger.info(f"【{cookie_id}】消息已保存（外部防抖已启用）: {message[:20]}...")
             
             # 获取该chat_id的锁，确保同一对话的消息串行处理
             chat_lock = self._get_chat_lock(chat_id)
             
-            # 使用锁确保同一chat_id的消息串行处理
             with chat_lock:
-                # 获取最近时间窗口内的所有用户消息
-                # 如果 skip_wait=True（外部防抖），查询窗口为6秒（1秒防抖 + 5秒缓冲）
-                # 如果 skip_wait=False（内部等待），查询窗口为25秒（10秒等待 + 10秒消息间隔 + 5秒缓冲）
+                # 检查是否有更新的消息
                 query_seconds = 6 if skip_wait else 25
                 recent_messages = self._get_recent_user_messages(chat_id, cookie_id, seconds=query_seconds)
-                logger.info(f"【{cookie_id}】最近{query_seconds}秒内的消息: {[msg['content'][:20] for msg in recent_messages]}")
                 
                 if recent_messages and len(recent_messages) > 0:
-                    # 只处理最后一条消息（时间戳最新的）
                     latest_message = recent_messages[-1]
                     if message_created_at != latest_message['created_at']:
-                        logger.info(f"【{cookie_id}】检测到有更新的消息，跳过当前消息: {message[:20]}... (时间:{message_created_at})，最新消息: {latest_message['content'][:20]}... (时间:{latest_message['created_at']})")
+                        logger.info(f"【{cookie_id}】检测到更新消息，跳过当前消息")
                         return None
-                    else:
-                        logger.info(f"【{cookie_id}】当前消息是最新消息，开始处理: {message[:20]}... (时间:{message_created_at})")
                 
-                # 1. 获取AI回复设置
+                # 1. 获取AI设置
                 settings = db_manager.get_ai_reply_settings(cookie_id)
+                custom_prompts = json.loads(settings['custom_prompts']) if settings['custom_prompts'] else {}
 
-                # 3. 获取对话历史
+                # 2. 获取对话历史
                 context = self.get_conversation_context(chat_id, cookie_id)
 
-                # 4. 获取议价次数
-                bargain_count = self.get_bargain_count(chat_id, cookie_id)
-
-                # 5. 检查议价轮数限制 (P0-1 竞争条件风险点 - 遵照指示未修改)
-                if intent == "price":
-                    max_bargain_rounds = settings.get('max_bargain_rounds', 3)
-                    if bargain_count >= max_bargain_rounds:
-                        logger.info(f"议价次数已达上限 ({bargain_count}/{max_bargain_rounds})，拒绝继续议价")
-                        refuse_reply = f"抱歉，这个价格已经是最优惠的了，不能再便宜了哦！"
-                        self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", refuse_reply, intent)
-                        return refuse_reply
-
-                # 6. 构建提示词
-                custom_prompts = json.loads(settings['custom_prompts']) if settings['custom_prompts'] else {}
-                system_prompt = custom_prompts.get(intent, self.default_prompts[intent])
-
-                # 7. 构建商品信息
-                item_desc = f"商品标题: {item_info.get('title', '未知')}\n"
-                item_desc += f"商品价格: {item_info.get('price', '未知')}元\n"
-                item_desc += f"商品描述: {item_info.get('desc', '无')}"
-
-                # 8. 构建对话历史
-                context_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context[-10:]])  # 最近10条
-
-                # 9. 构建用户消息
+                # 3. 获取对话轮数和议价设置（供AI参考）
+                conversation_rounds = self.get_conversation_rounds(chat_id, cookie_id)
                 max_bargain_rounds = settings.get('max_bargain_rounds', 3)
                 max_discount_percent = settings.get('max_discount_percent', 10)
                 max_discount_amount = settings.get('max_discount_amount', 100)
 
-                user_prompt = f"""商品信息：
+                # 4. 构建统一的系统提示词（整合意图判断和回复生成）
+                system_prompt = self._build_unified_system_prompt(custom_prompts, settings)
+
+                # 5. 构建商品信息
+                item_desc = f"商品标题: {item_info.get('title', '未知')}\n"
+                item_desc += f"商品价格: {item_info.get('price', '未知')}元\n"
+                item_desc += f"商品描述: {item_info.get('desc', '无')}"
+
+                # 6. 构建对话历史字符串
+                context_str = ""
+                if context:
+                    context_str = "\n".join([
+                        f"{'客户' if msg['role'] == 'user' else '客服'}: {msg['content']}" 
+                        for msg in context[-10:]
+                    ])
+
+                # 7. 构建用户消息（包含所有上下文）
+                user_prompt = f"""## 商品信息
 {item_desc}
 
-对话历史：
-{context_str}
+## 对话历史
+{context_str if context_str else '(新对话，暂无历史)'}
 
-议价设置：
-- 当前议价次数：{bargain_count}
-- 最大议价轮数：{max_bargain_rounds}
-- 最大优惠百分比：{max_discount_percent}%
-- 最大优惠金额：{max_discount_amount}元
+## 对话状态
+- 当前对话轮数：第{conversation_rounds + 1}轮
+- 议价限制：最多{max_bargain_rounds}轮议价后需坚持底价
+- 最大可优惠：{max_discount_percent}%或{max_discount_amount}元
 
-用户消息：{message}
+## 当前用户消息
+{message}
 
-请根据以上信息生成回复："""
+请根据以上信息，直接回复用户："""
 
-                # 10. 调用AI生成回复
+                # 8. 构建消息列表
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ]
 
-                reply = None # 初始化 reply 变量
+                # 9. 调用AI生成回复
+                reply = None
 
                 if self._is_dashscope_api(settings):
-                    logger.info(f"使用DashScope API生成回复")
-                    reply = self._call_dashscope_api(settings, messages, max_tokens=100, temperature=0.7)
+                    logger.info("使用DashScope API生成回复")
+                    reply = self._call_dashscope_api(settings, messages, max_tokens=150, temperature=0.7)
                 
                 elif self._is_gemini_api(settings):
-                    logger.info(f"使用Gemini API生成回复")
-                    reply = self._call_gemini_api(settings, messages, max_tokens=100, temperature=0.7)
+                    logger.info("使用Gemini API生成回复")
+                    reply = self._call_gemini_api(settings, messages, max_tokens=150, temperature=0.7)
                 
                 else:
-                    logger.info(f"使用OpenAI兼容API生成回复")
-                    # 修复 P0-2: 调用已修改的无状态客户端创建方法
+                    logger.info("使用OpenAI兼容API生成回复")
                     client = self._create_openai_client(cookie_id)
                     if not client:
                         return None
-                    logger.info(f"messages:{messages}")
-                    reply = self._call_openai_api(client, settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_openai_api(client, settings, messages, max_tokens=150, temperature=0.7)
 
-                # 11. 保存AI回复到对话记录
-                self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent)
-
-                # 12. 更新议价次数 (此方法已在 get_bargain_count 中通过 SQL COUNT(*) 隐式实现)
-                if intent == "price":
-                    # self.increment_bargain_count(chat_id, cookie_id) # 此行原先就没有，保持不变
-                    pass
+                # 10. 保存AI回复到对话记录
+                self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent=None)
                 
                 logger.info(f"AI回复生成成功 (账号: {cookie_id}): {reply}")
                 return reply
@@ -483,20 +441,20 @@ class AIReplyEngine:
         except Exception as e:
             logger.error(f"保存对话记录失败: {e}")
             return None
-    def get_bargain_count(self, chat_id: str, cookie_id: str) -> int:
-        """获取议价次数"""
+    def get_conversation_rounds(self, chat_id: str, cookie_id: str) -> int:
+        """获取对话轮数（用户消息数量）"""
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
                 SELECT COUNT(*) FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND intent = 'price' AND role = 'user'
+                WHERE chat_id = ? AND cookie_id = ? AND role = 'user'
                 ''', (chat_id, cookie_id))
                 
                 result = cursor.fetchone()
                 return result[0] if result else 0
         except Exception as e:
-            logger.error(f"获取议价次数失败: {e}")
+            logger.error(f"获取对话轮数失败: {e}")
             return 0
     
     def _get_recent_user_messages(self, chat_id: str, cookie_id: str, seconds: int = 2) -> List[Dict]:
@@ -531,21 +489,6 @@ class AIReplyEngine:
             logger.error(f"获取最近用户消息列表失败: {e}")
             return []
     
-    def increment_bargain_count(self, chat_id: str, cookie_id: str):
-        """(此方法已废弃，通过 get_bargain_count 的 SQL 查询实现)"""
-        pass
-    
-    #
-    # --- 修复 P0-2: 移除所有有状态的缓存管理方法 ---
-    #
-    
-    # def clear_client_cache(self, cookie_id: str = None):
-    #     """(已移除) 清理客户端缓存"""
-    #     pass
-    
-    # def cleanup_unused_clients(self, max_idle_hours: int = 24):
-    #     """(已移除) 清理长时间未使用的客户端"""
-    #     pass
 
 
 # 全局AI回复引擎实例

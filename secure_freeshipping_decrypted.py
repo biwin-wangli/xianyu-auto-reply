@@ -29,7 +29,7 @@ class SecureFreeshipping:
             from db_manager import db_manager
             
             # 更新数据库中的Cookie
-            db_manager.update_config_cookies(self.cookie_id, self.cookies_str)
+            db_manager.update_cookie_account_info(self.cookie_id, cookie_value=self.cookies_str)
             logger.debug(f"【{self.cookie_id}】Cookie已更新到数据库")
             
         except Exception as e:

@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
+
 """项目启动入口：
 
 1. 创建 CookieManager，按配置文件 / 环境变量初始化账号任务
@@ -440,6 +443,7 @@ from config import AUTO_REPLY, COOKIES_LIST
 import cookie_manager as cm
 from db_manager import db_manager
 from file_log_collector import setup_file_logging
+from usage_statistics import report_user_count
 
 
 def _start_api_server():
@@ -573,6 +577,12 @@ async def main():
     print("启动 API 服务线程...")
     threading.Thread(target=_start_api_server, daemon=True).start()
     print("API 服务线程已启动")
+
+    # 上报用户统计
+    try:
+        await report_user_count()
+    except Exception as e:
+        logger.debug(f"上报用户统计失败: {e}")
 
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")

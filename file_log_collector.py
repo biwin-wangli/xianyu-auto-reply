@@ -59,18 +59,35 @@ class FileLogCollector:
         try:
             from loguru import logger
             
-            # 添加文件输出
+            # 确保logs目录存在
+            logs_dir = Path("logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 添加实时日志文件输出（用于Web界面实时监控）
             logger.add(
                 self.log_file,
                 format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}",
-                level="INFO",  # 从DEBUG改为INFO，减少日志量
+                level="INFO",
                 rotation="10 MB",
-                retention="3 days",  # 从7天改为3天，减少磁盘占用
-                enqueue=False,  # 改为False，避免队列延迟
-                buffering=1     # 行缓冲，立即写入
+                retention="3 days",
+                enqueue=False,
+                buffering=1
             )
             
-            logger.info("文件日志收集器已启动")
+            # 添加按日期轮转的日志文件输出到logs目录
+            logger.add(
+                "logs/xianyu_{time:YYYY-MM-DD}.log",
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+                level="INFO",
+                rotation="00:00",  # 每天午夜轮转
+                retention="7 days",  # 保留7天
+                compression="zip",  # 压缩旧日志
+                enqueue=False,
+                buffering=1,
+                encoding="utf-8"
+            )
+            
+            logger.info("文件日志收集器已启动（实时日志 + 按日期轮转日志）")
             
         except ImportError:
             pass
