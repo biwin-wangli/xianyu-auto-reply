@@ -579,10 +579,10 @@ async def main():
     print("API 服务线程已启动")
 
     # 上报用户统计
-    try:
-        await report_user_count()
-    except Exception as e:
-        logger.debug(f"上报用户统计失败: {e}")
+    # try:
+    #     await report_user_count()
+    # except Exception as e:
+    #     logger.debug(f"上报用户统计失败: {e}")
 
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")

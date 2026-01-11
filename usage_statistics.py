@@ -113,7 +113,7 @@ class UsageStatistics:
                         'User-Agent': 'XianyuAutoReply/2.2.0'
                     }
 
-                    logger.debug()
+                    logger.debug(f"上报数据内容：{data}, header: {headers}");
                     async with session.post(
                         self.api_endpoint,
                         json=data,
