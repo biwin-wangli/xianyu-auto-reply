@@ -3,6 +3,7 @@ package com.xianyu.autoreply.service;
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.BoundingBox;
 import com.microsoft.playwright.options.LoadState;
+import com.microsoft.playwright.options.WaitUntilState;
 import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.repository.CookieRepository;
 import com.xianyu.autoreply.utils.BrowserStealth;
@@ -493,67 +494,180 @@ public class BrowserService {
     }
 
     public Map<String, String> refreshCookies(String cookieId) {
-        log.info("Attempting to refresh cookies for id: {}", cookieId);
+        log.info("【Cookie Refresh】Attempting to refresh cookies for id: {}", cookieId);
         Cookie cookie = cookieRepository.findById(cookieId).orElse(null);
-        if (cookie == null || cookie.getUsername() == null || cookie.getPassword() == null) {
-            log.error("Cannot refresh cookies. No valid credentials found for id: {}", cookieId);
-            return Collections.emptyMap();
+        if (cookie == null || cookie.getValue() == null) {
+             log.error("【Cookie Refresh】Cannot refresh. No valid cookie found for id: {}", cookieId);
+             return Collections.emptyMap();
         }
 
         BrowserContext context = null;
         try {
-            Browser.NewContextOptions options = new Browser.NewContextOptions()
-                .setViewportSize(1920, 1080)
-                .setLocale("zh-CN")
-                .setTimezoneId("Asia/Shanghai");
+            // Use a fresh context for each refresh to avoid pollution
+             Browser.NewContextOptions options = new Browser.NewContextOptions()
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .setViewportSize(1920, 1080);
             
             context = browser.newContext(options);
+            
+            // 1. Parse and Set Cookies
+            List<com.microsoft.playwright.options.Cookie> playwrightCookies = new ArrayList<>();
+            String[] parts = cookie.getValue().split(";");
+            for (String part : parts) {
+                String[] kv = part.trim().split("=", 2);
+                if (kv.length == 2) {
+                     playwrightCookies.add(new com.microsoft.playwright.options.Cookie(kv[0], kv[1])
+                        .setDomain(".goofish.com")
+                        .setPath("/"));
+                }
+            }
+            context.addCookies(playwrightCookies);
+            log.info("【Cookie Refresh】Loaded {} cookies for {}", playwrightCookies.size(), cookieId);
+
+            // 2. Navigate and Refresh
             Page page = context.newPage();
             addStealthScripts(page);
             
-            page.navigate("https://login.taobao.com/member/login.jhtml");
-
+            String targetUrl = "https://www.goofish.com/im";
+            log.info("【Cookie Refresh】Navigating to {}", targetUrl);
+            
             try {
-                if (page.isVisible("i.iconfont.icon-mimadenglu")) {
-                    page.click("i.iconfont.icon-mimadenglu");
-                }
-            } catch (Exception e) {}
-
-            page.fill("#fm-login-id", cookie.getUsername());
-            page.fill("#fm-login-password", cookie.getPassword());
-            page.click("button.fm-button.fm-submit.password-login");
-
-            try {
-                page.waitForLoadState(LoadState.LOAD, new Page.WaitForLoadStateOptions().setTimeout(10000));
-            } catch (Exception e) {}
-
-            if (page.url().contains("login.taobao.com")) {
-                log.error("Cookie refresh failed for {}. Still on login page.", cookieId);
-                return Collections.emptyMap();
+                page.navigate(targetUrl, new Page.NavigateOptions().setTimeout(15000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+            } catch (Exception e) {
+                 log.warn("【Cookie Refresh】Navigation timeout, trying fallback...");
+                 try {
+                     page.navigate(targetUrl, new Page.NavigateOptions().setTimeout(25000).setWaitUntil(WaitUntilState.LOAD));
+                 } catch (Exception ex) {
+                     log.warn("【Cookie Refresh】Fallback navigation also timed out (proceeding anyway).");
+                 }
             }
 
+            // Wait for page load
+            try { Thread.sleep(2000); } catch (Exception e) {}
+
+            // Reload to force refresh
+            log.info("【Cookie Refresh】Reloading page...");
+            try {
+                 page.reload(new Page.ReloadOptions().setTimeout(15000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+            } catch (Exception e) {
+                 log.warn("【Cookie Refresh】Reload timeout (proceeding anyway).");
+            }
+            try { Thread.sleep(1000); } catch (Exception e) {}
+
+            // 3. Capture New Cookies
             List<com.microsoft.playwright.options.Cookie> newCookies = context.cookies();
-            StringBuilder sb = new StringBuilder();
+            log.info("【Cookie Refresh】Captured {} cookies after refresh.", newCookies.size());
+            
+            // 4. Compare and Update
+            Map<String, String> newCookieMap = new HashMap<>();
             for (com.microsoft.playwright.options.Cookie c : newCookies) {
-                sb.append(c.name).append("=").append(c.value).append("; ");
+                newCookieMap.put(c.name, c.value);
             }
-            String cookieStr = sb.toString();
             
-            cookie.setValue(cookieStr);
-            cookieRepository.save(cookie);
+            // Simple check if unb exists
+            if (!newCookieMap.containsKey("unb")) {
+                 log.warn("【Cookie Refresh】'unb' missing in refreshed cookies. Refresh might have failed or session invalid.");
+                 return Collections.emptyMap();
+            }
+
+            // Construct new cookie string
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> entry : newCookieMap.entrySet()) {
+                sb.append(entry.getKey()).append("=").append(entry.getValue()).append("; ");
+            }
+            String newCookieStr = sb.toString();
             
-            log.info("Successfully refreshed cookies for {}", cookieId);
-            return Collections.emptyMap(); 
+            // Check for changes (Logic similar to Python's check)
+            // For now, we update if string is different, or if we want to be robust, we just save.
+            // Python checks if keys changed or values changed.
+            // Let's just save to be safe and ensure "last updated" is fresh if DB has such field.
+            
+            if (!newCookieStr.equals(cookie.getValue())) {
+                cookie.setValue(newCookieStr);
+                cookieRepository.save(cookie);
+                log.info("【Cookie Refresh】Cookies updated and saved to DB for {}", cookieId);
+                return newCookieMap;
+            } else {
+                 log.info("【Cookie Refresh】Cookies identical, no DB update needed.");
+                 return newCookieMap;
+            }
 
         } catch (Exception e) {
-            log.error("Exception during cookie refresh for {}", cookieId, e);
+            log.error("【Cookie Refresh】Exception during refresh for {}", cookieId, e);
             return Collections.emptyMap();
         } finally {
             if (context != null) {
-                context.close();
+                try { context.close(); } catch (Exception e) { log.error("Error closing context", e); }
             }
         }
     }
+
+    /**
+     * Verifies and refreshes cookies obtained from QR Login.
+     * Replicates Python's refresh_cookies_from_qr_login logic.
+     */
+    public Map<String, String> verifyQrLoginCookies(Map<String, String> qrCookies, String accountId) {
+        log.info("【QR Login】Verifying cookies for account: {}", accountId);
+        
+        try (BrowserContext context = browser.newContext(new Browser.NewContextOptions()
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .setViewportSize(1920, 1080))) {
+            
+            // 1. Add Cookies
+            List<com.microsoft.playwright.options.Cookie> playwrightCookies = new ArrayList<>();
+            for (Map.Entry<String, String> entry : qrCookies.entrySet()) {
+                playwrightCookies.add(new com.microsoft.playwright.options.Cookie(entry.getKey(), entry.getValue())
+                        .setDomain(".goofish.com")
+                        .setPath("/"));
+            }
+            context.addCookies(playwrightCookies);
+            
+            // 2. Navigate to verify
+            Page page = context.newPage();
+            try {
+                log.info("【QR Login】Navigating to goofish.com to verify login...");
+                page.navigate("https://www.goofish.com/");
+                page.waitForLoadState();
+                
+                // Wait for some login indicator
+                // Python uses: page.wait_for_selector(".mod-user-info", timeout=5000) or similar checks
+                // Let's try to detect if we are logged in.
+                
+                // Using the selector from checkLoginSuccessByElement as a reference
+                try {
+                    page.waitForSelector(".rc-virtual-list-holder-inner", new Page.WaitForSelectorOptions().setTimeout(5000));
+                    log.info("【QR Login】Login verification successful (found user element).");
+                } catch (Exception e) {
+                    log.warn("【QR Login】Could not find standard user element. Checking cookie presence again.");
+                }
+                
+                // 3. Capture refreshed cookies
+                List<com.microsoft.playwright.options.Cookie> freshCookies = context.cookies();
+                boolean unbFound = freshCookies.stream().anyMatch(c -> "unb".equals(c.name));
+                
+                if (unbFound) {
+                    log.info("【QR Login】Verification passed. UNB found. Total cookies: {}", freshCookies.size());
+                    Map<String, String> resultMap = new HashMap<>();
+                    for (com.microsoft.playwright.options.Cookie c : freshCookies) {
+                        resultMap.put(c.name, c.value);
+                    }
+                    return resultMap;
+                } else {
+                     log.warn("【QR Login】Verification failed - UNB cookie missing after navigation.");
+                }
+                
+            } catch (Exception e) {
+                log.error("【QR Login】Error during browser verification navigation", e);
+            }
+            
+        } catch (Exception e) {
+            log.error("【QR Login】Error creating browser context for verification", e);
+        }
+        
+        return null; // Failed
+    }
+
+
 
     private void addStealthScripts(Page page) {
         page.addInitScript(BrowserStealth.STEALTH_SCRIPT);
