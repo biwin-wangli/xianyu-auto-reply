@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
@@ -92,7 +93,7 @@ public class BrowserService {
         sessionData.put("message", "正在初始化浏览器...");
         passwordLoginSessions.put(sessionId, sessionData);
 
-        java.util.concurrent.CompletableFuture.runAsync(() -> processPasswordLogin(sessionId, accountId, account, password, showBrowser, userId));
+        CompletableFuture.runAsync(() -> processPasswordLogin(sessionId, accountId, account, password, showBrowser, userId));
 
         return sessionId;
     }
@@ -105,7 +106,7 @@ public class BrowserService {
         Map<String, Object> session = passwordLoginSessions.get(sessionId);
         BrowserContext context = null;
         try {
-            log.info("Starting password login for session: {}, showBrowser: {}", sessionId, showBrowser);
+            log.info("【Login Task】Starting password login for session: {}, accountId: {}, showBrowser: {}", sessionId, accountId, showBrowser);
             session.put("message", "正在启动浏览器...");
 
             String userDataDir = "browser_data/user_" + accountId;
@@ -125,6 +126,7 @@ public class BrowserService {
                     .setHeadless(!showBrowser)
                     .setArgs(args)
                     .setViewportSize(1920, 1080)
+                    // Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0
                     .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                     .setLocale("zh-CN")
                     .setAcceptDownloads(true)
@@ -139,6 +141,7 @@ public class BrowserService {
                  }
             }
             
+            log.info("【Login Task】Launching browser context with userDataDir: {}", userDataDir);
             context = playwright.chromium().launchPersistentContext(java.nio.file.Paths.get(userDataDir), options);
             
             Page page = context.pages().isEmpty() ? context.newPage() : context.pages().get(0);
@@ -146,36 +149,39 @@ public class BrowserService {
             page.addInitScript(BrowserStealth.STEALTH_SCRIPT);
             
             session.put("message", "正在导航至登录页...");
+            log.info("【Login Task】Navigating to https://www.goofish.com/im");
             page.navigate("https://www.goofish.com/im");
             
             // Wait for network idle to ensure frames loaded
             try {
                 page.waitForLoadState(LoadState.NETWORKIDLE, new Page.WaitForLoadStateOptions().setTimeout(10000));
             } catch (Exception e) {
-                 log.warn("Network idle timeout, proceeding...");
+                 log.warn("【Login Task】Network idle timeout, proceeding...");
             }
             Thread.sleep(2000);
             
             // 1. Check if already logged in
             if (checkLoginSuccessByElement(page)) {
+                 log.info("【Login Task】Already logged in detected immediately.");
                  handleLoginSuccess(page, context, accountId, account, password, showBrowser, userId, session);
                  return;
             }
 
             session.put("message", "正在查找登录表单...");
+            log.info("【Login Task】Searching for login frame...");
             
             // 2. Robust Frame Search (Main Page OR Frames)
             Frame loginFrame = findLoginFrame(page);
             
             // Retry logic for finding frame
             if (loginFrame == null) {
-                log.info("Login frame not found, waiting and retrying...");
+                log.info("【Login Task】Login frame not found, waiting 3s and retrying...");
                 Thread.sleep(3000); // Wait more
                 loginFrame = findLoginFrame(page);
             }
             
             if (loginFrame != null) {
-                log.info("Found login form in frame: {}", loginFrame.url());
+                log.info("【Login Task】Found login form in frame: {}", loginFrame.url());
                 // Switch to password login
                 try {
                     ElementHandle switchLink = loginFrame.querySelector("i.iconfont.icon-mimadenglu");
@@ -185,15 +191,18 @@ public class BrowserService {
                     }
                     
                     if (switchLink != null && switchLink.isVisible()) {
-                         log.info("Clicking password switch link...");
+                         log.info("【Login Task】Clicking password switch link...");
                          switchLink.click();
                          Thread.sleep(1000);
+                    } else {
+                        log.info("【Login Task】Password switch link not found or not visible, assuming possibly already on password tab or different layout.");
                     }
                 } catch (Exception e) {
-                    log.warn("Error switching to password tab: {}", e.getMessage());
+                    log.warn("【Login Task】Error switching to password tab: {}", e.getMessage());
                 }
 
                 session.put("message", "正在输入账号密码...");
+                log.info("【Login Task】Inputting credentials for user: {}", account);
                 
                 // Clear and Fill with human delay
                 loginFrame.fill("#fm-login-id", ""); 
@@ -211,19 +220,22 @@ public class BrowserService {
                 try {
                     ElementHandle agreement = loginFrame.querySelector("#fm-agreement-checkbox");
                     if (agreement != null && !agreement.isChecked()) {
+                        log.info("【Login Task】Checking agreement checkbox...");
                         agreement.click();
                     }
                 } catch (Exception e) {}
 
                 session.put("message", "正在点击登录...");
+                log.info("【Login Task】Clicking submit button...");
                 loginFrame.click("button.fm-button.fm-submit.password-login");
                 Thread.sleep(3000); 
             } else {
                  if (checkLoginSuccessByElement(page)) {
+                     log.info("【Login Task】Login frame not found but seems logged in.");
                      handleLoginSuccess(page, context, accountId, account, password, showBrowser, userId, session);
                      return;
                  }
-                 log.error("Login form NOT found after retries. Page title: {}, URL: {}", page.title(), page.url());
+                 log.error("【Login Task】Login form NOT found after retries. Page title: {}, URL: {}", page.title(), page.url());
                  session.put("status", "failed");
                  session.put("message", "无法找到登录框 (URL: " + page.url() + ")");
                  // Capture screenshot for debugging if possible? (not easy to send back via session map safely)
@@ -232,6 +244,7 @@ public class BrowserService {
 
             // Post-login / Slider Loop
             session.put("message", "正在检测登录状态与滑块...");
+            log.info("【Login Task】Entering post-submission monitor loop...");
             
             long startTime = System.currentTimeMillis();
             long maxWaitTime = 450 * 1000L; 
@@ -241,6 +254,7 @@ public class BrowserService {
             
             while (System.currentTimeMillis() - startTime < maxWaitTime) {
                 if (checkLoginSuccessByElement(page)) {
+                    log.info("【Login Task】Login Success Detected!");
                     success = true;
                     break;
                 }
@@ -248,6 +262,7 @@ public class BrowserService {
                 boolean sliderFound = solveSliderRecursively(page);
                 if (sliderFound) {
                      session.put("message", "正在处理滑块验证...");
+                     log.info("【Login Task】Slider solved, page reloading for check...");
                      Thread.sleep(3000);
                      page.reload();
                      Thread.sleep(2000);
@@ -256,6 +271,7 @@ public class BrowserService {
 
                  String content = page.content();
                  if (content.contains("验证") || content.contains("安全检测") || content.contains("security-check")) {
+                     log.warn("【Login Task】Security verification required (SMS/Face).");
                      session.put("status", "verification_required");
                      session.put("message", "需要二次验证(短信/人脸)，请手动在浏览器中完成");
                      if (!showBrowser) {
@@ -266,6 +282,7 @@ public class BrowserService {
                  }
                  
                  if (content.contains("账号名或登录密码不正确") || content.contains("账密错误")) {
+                      log.error("【Login Task】Invalid credentials detected.");
                       session.put("status", "failed");
                       session.put("message", "账号名或登录密码不正确");
                       return;
@@ -277,16 +294,18 @@ public class BrowserService {
             if (success) {
                 handleLoginSuccess(page, context, accountId, account, password, showBrowser, userId, session);
             } else {
+                log.error("【Login Task】Timeout waiting for login success.");
                 session.put("status", "failed");
                 session.put("message", "登录超时或失败");
             }
 
         } catch (Exception e) {
-            log.error("Password login failed", e);
+            log.error("【Login Task】Password login exception", e);
             session.put("status", "failed");
             session.put("message", "异常: " + e.getMessage());
         } finally {
             if (context != null) {
+                log.info("【Login Task】Closing browser context.");
                 context.close(); 
             }
         }
@@ -307,11 +326,11 @@ public class BrowserService {
         for (String s : selectors) {
             try {
                 if (page.isVisible(s)) {
-                    log.info("Found login element in Main Frame: {}", s);
+                    log.info("【Login Task】Found login element in Main Frame: {}", s);
                     return page.mainFrame();
                 }
                 if (page.querySelector(s) != null) { // Fallback check availability even if not visible yet
-                     log.info("Found login element in Main Frame (hidden?): {}", s);
+                     log.info("【Login Task】Found login element in Main Frame (hidden?): {}", s);
                      return page.mainFrame();
                 }
             } catch (Exception e) {}
@@ -322,11 +341,11 @@ public class BrowserService {
             for (String s : selectors) {
                 try {
                      if (frame.isVisible(s)) {
-                         log.info("Found login element in Frame ({}): {}", frame.url(), s);
+                         log.info("【Login Task】Found login element in Frame ({}): {}", frame.url(), s);
                          return frame;
                      }
                      if (frame.querySelector(s) != null) {
-                         log.info("Found login element in Frame ({}) (hidden?): {}", frame.url(), s);
+                         log.info("【Login Task】Found login element in Frame ({}) (hidden?): {}", frame.url(), s);
                          return frame;
                      }
                 } catch (Exception e) {}
@@ -340,6 +359,7 @@ public class BrowserService {
         try {
             ElementHandle element = page.querySelector(".rc-virtual-list-holder-inner");
             if (element != null && element.isVisible()) {
+                log.info("【Login Task】Success Indicator Found: .rc-virtual-list-holder-inner");
                 Object childrenCount = element.evaluate("el => el.children.length");
                 if (childrenCount instanceof Number && ((Number)childrenCount).intValue() > 0) {
                     return true;
@@ -347,14 +367,18 @@ public class BrowserService {
                 return true; 
             }
             if (page.url().contains("goofish.com/im") && page.querySelector("#fm-login-id") == null) {
+                log.info("【Login Task】Success Indicator: On IM page and login input is gone.");
                 return false;
             }
-        } catch (Exception e) {}
+        } catch (Exception e) {
+            log.trace("【Login Task】Error checking login success element", e);
+        }
         return false;
     }
     
     private void handleLoginSuccess(Page page, BrowserContext context, String accountId, String account, String password, boolean showBrowser, Long userId, Map<String, Object> session) {
         session.put("message", "登录成功，正在获取Cookie...");
+        log.info("【Login Task】Login Success confirmed. Extracting cookies...");
         
         List<com.microsoft.playwright.options.Cookie> cookies = new ArrayList<>();
         int retries = 10;
@@ -363,12 +387,15 @@ public class BrowserService {
         while (retries-- > 0) {
             cookies = context.cookies();
             unbFound = cookies.stream().anyMatch(c -> "unb".equals(c.name) && c.value != null && !c.value.isEmpty());
-            if (unbFound) break;
+            if (unbFound) {
+                log.info("【Login Task】Crucial 'unb' cookie found!");
+                break;
+            }
             try { Thread.sleep(1000); } catch (Exception e) {}
         }
         
         if (!unbFound) {
-             log.warn("Login seemed successful but 'unb' cookie missing for {}", accountId);
+             log.warn("【Login Task】Login seemed successful but 'unb' cookie missing for {}. Cookies found: {}", accountId, cookies.size());
         }
 
         StringBuilder sb = new StringBuilder();
@@ -376,6 +403,8 @@ public class BrowserService {
             sb.append(c.name).append("=").append(c.value).append("; ");
         }
         String cookieStr = sb.toString();
+        
+        log.info("【Login Task】Total Cookies captured: {}", cookies.size());
         
         Cookie cookie = cookieRepository.findById(accountId).orElse(new Cookie());
         cookie.setId(accountId);
@@ -391,6 +420,7 @@ public class BrowserService {
         session.put("message", "登录成功");
         session.put("username", account);
         session.put("cookies_count", cookies.size());
+        log.info("【Login Task】Session completed successfully. Data saved to DB.");
     }
 
     private boolean solveSliderRecursively(Page page) {
@@ -419,7 +449,7 @@ public class BrowserService {
             if (sliderButton == null) sliderButton = frame.querySelector(".nc_iconfont");
             
             if (sliderButton != null && sliderButton.isVisible()) {
-                log.info("Detected slider in frame: {}", frame.url());
+                log.info("【Login Task】Detected slider in frame: {}", frame.url());
                 BoundingBox box = sliderButton.boundingBox();
                 if (box == null) return false;
                 
@@ -429,6 +459,7 @@ public class BrowserService {
                  
                  BoundingBox trackBox = track.boundingBox();
                  double distance = trackBox.width - box.width;
+                 log.info("【Login Task】Solving Slider: distance={}", distance);
                  
                  List<BrowserTrajectoryUtils.TrajectoryPoint> trajectory = 
                      BrowserTrajectoryUtils.generatePhysicsTrajectory(distance);
@@ -448,12 +479,15 @@ public class BrowserService {
                  frame.page().mouse().up();
                  
                  Thread.sleep(1000);
-                 if (!sliderButton.isVisible()) return true;
+                 if (!sliderButton.isVisible()) {
+                     log.info("【Login Task】Slider solved (button disappeared)!");
+                     return true;
+                 }
                  
                  return true; 
             }
         } catch (Exception e) {
-            log.warn("Error solving slider: {}", e.getMessage());
+            log.warn("【Login Task】Error solving slider: {}", e.getMessage());
         }
         return false;
     }
