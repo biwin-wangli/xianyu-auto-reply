@@ -2,6 +2,7 @@ package com.xianyu.autoreply.entity;
 
 import jakarta.persistence.*;
 import lombok.Data;
+import org.hibernate.annotations.ColumnDefault;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
@@ -22,6 +23,8 @@ public class MessageNotification {
     @Column(name = "channel_id", nullable = false)
     private Long channelId;
 
+    @Column(nullable = false)
+    @ColumnDefault("true")
     private Boolean enabled = true;
 
     @CreationTimestamp
@@ -31,4 +34,9 @@ public class MessageNotification {
     @UpdateTimestamp
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
+    
+    // Optional: ManyToOne relation to channel for easy fetching
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "channel_id", insertable = false, updatable = false)
+    private NotificationChannel channel;
 }

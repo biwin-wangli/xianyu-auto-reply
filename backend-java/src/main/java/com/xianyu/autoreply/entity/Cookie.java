@@ -1,5 +1,6 @@
 package com.xianyu.autoreply.entity;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.persistence.*;
 import lombok.Data;
 import org.hibernate.annotations.ColumnDefault;
@@ -20,10 +21,12 @@ public class Cookie {
     private String value;
 
     @Column(name = "user_id", nullable = false)
+    @JsonProperty("user_id")
     private Long userId;
 
     @Column(name = "auto_confirm")
     @ColumnDefault("1")
+    @JsonProperty("auto_confirm")
     private Integer autoConfirm = 1;
 
     @ColumnDefault("''")
@@ -31,6 +34,7 @@ public class Cookie {
 
     @Column(name = "pause_duration")
     @ColumnDefault("10")
+    @JsonProperty("pause_duration")
     private Integer pauseDuration = 10;
 
     @ColumnDefault("''")
@@ -41,6 +45,7 @@ public class Cookie {
 
     @Column(name = "show_browser")
     @ColumnDefault("0")
+    @JsonProperty("show_browser")
     private Integer showBrowser = 0;
 
     @Column(name = "enabled")
