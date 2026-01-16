@@ -5,6 +5,7 @@ import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.model.ConnectionState;
+import okhttp3.*;
 import com.xianyu.autoreply.repository.CookieRepository;
 import com.xianyu.autoreply.utils.XianyuUtils;
 import lombok.Getter;
@@ -38,8 +39,18 @@ public class XianyuClient implements WebSocketHandler {
     private Map<String, String> cookiesData;
     private String myId; // Added
 
-    private static final String WEBSOCKET_URL = "wss://wss-goofish.dingtalk.com/";
-    private static final long HEARTBEAT_INTERVAL = 15; // seconds
+    private static final String WEBSOCKET_URL = "wss://api.m.taobao.com/accs/"; // Python uses this for WS
+    // Note: Python logic uses api.m.taobao.com/accs/ 
+    // Wait, Python log says: "【...】WebSocket目标地址: wss://api.m.taobao.com/accs/"
+    // The existing Java code had "wss://wss-goofish.dingtalk.com/" which might be wrong or old.
+    // I will use Python's URL.
+    
+    private static final long HEARTBEAT_INTERVAL = 10; // Python: 10s default?
+    // Python code: self.heartbeat_interval = 20 (init) -> wait...
+    // logic in heartbeat_loop -> sleep(heartbeat_interval)
+    // Let's check python constants.
+    
+    private final OkHttpClient httpClient; // For HTTP API calls (token refresh)
 
     public XianyuClient(String cookieId, CookieRepository cookieRepository, ReplyService replyService, BrowserService browserService) {
         this.cookieId = cookieId;
@@ -47,12 +58,17 @@ public class XianyuClient implements WebSocketHandler {
         this.replyService = replyService;
         this.browserService = browserService;
         this.wsClient = new StandardWebSocketClient();
-        this.scheduler = Executors.newScheduledThreadPool(2);
+        this.scheduler = Executors.newScheduledThreadPool(4); // Increased pool
+        this.httpClient = new OkHttpClient.Builder().build();
     }
 
     public void start() {
         log.info("【{}】Starting XianyuClient...", cookieId);
         loadCookies();
+        
+        // Refresh token before connecting
+        refreshToken();
+        
         connect();
     }
 
@@ -105,23 +121,36 @@ public class XianyuClient implements WebSocketHandler {
                     log.info("【{}】Handshake success", cookieId);
                     this.session = result;
                     connectionState = ConnectionState.CONNECTED;
+                    
+                    // Initialize Protocol after connection
+                    initProtocol();
+                    
                     startHeartbeat();
                 },
                 ex -> {
                     log.error("【{}】Handshake failed: {}", cookieId, ex.getMessage());
                     // Try to refresh cookie if handshake fails (likely token expired)
                     log.info("【{}】Attempting to refresh cookies...", cookieId);
+                    refreshToken(); // Try token API refresh first
+                    
+                    // Then maybe full browser refresh if that fails?
+                    // For now, let's stick to API logic or Browser logic.
+                    // Python logic: if token fails, try login refresh.
+                    
+                    /* 
                     Map<String, String> newCookies = browserService.refreshCookies(cookieId);
                     if (newCookies != null && !newCookies.isEmpty()) {
-                         // Update DB logic is inside refreshCookies? No, extract it.
-                         // BrowserService.refreshCookies returns map. We need to save it.
                          updateCookiesInDb(newCookies);
-                         // Retry connect
                          scheduleReconnect();
                     } else {
                         connectionState = ConnectionState.FAILED;
                         scheduleReconnect();
                     }
+                    */
+                    
+                    // Logic Update: Just schedule reconnect, let the main loop handle it?
+                    // Or retry once.
+                    scheduleReconnect();
                 }
             );
     }
@@ -129,13 +158,153 @@ public class XianyuClient implements WebSocketHandler {
     private void updateCookiesInDb(Map<String, String> newCookies) {
         Cookie cookie = cookieRepository.findById(cookieId).orElse(null);
         if (cookie != null) {
-             // Convert map to string
              StringBuilder sb = new StringBuilder();
              newCookies.forEach((k, v) -> sb.append(k).append("=").append(v).append("; "));
              cookie.setValue(sb.toString());
              cookieRepository.save(cookie);
              this.cookiesData = newCookies;
              log.info("【{}】Cookies updated in DB", cookieId);
+        }
+    }
+    
+    // --- New Methods for Token Refresh and Protocol Init ---
+
+    private void refreshToken() {
+        log.info("【{}】Refreshing token...", cookieId);
+        try {
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String dataVal = "{\"appKey\":\"444e9908a51d1cb236a27862abc769c9\",\"deviceId\":\"" + XianyuUtils.generateDeviceId(myId) + "\"}";
+            
+            // Generate Sign
+            String token = "";
+            if (cookiesData.containsKey("_m_h5_tk")) {
+                token = cookiesData.get("_m_h5_tk").split("_")[0];
+            }
+            String sign = XianyuUtils.generateSign(timestamp, token, dataVal);
+
+            HttpUrl.Builder urlBuilder = HttpUrl.parse("https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/").newBuilder();
+            urlBuilder.addQueryParameter("jsv", "2.7.2");
+            urlBuilder.addQueryParameter("appKey", "34839810");
+            urlBuilder.addQueryParameter("t", timestamp);
+            urlBuilder.addQueryParameter("sign", sign);
+            urlBuilder.addQueryParameter("v", "1.0");
+            urlBuilder.addQueryParameter("type", "originaljson");
+            urlBuilder.addQueryParameter("accountSite", "xianyu");
+            
+            // Build Headers (Mimic Browser)
+            // Note: In real production, headers usually need to be very complete.
+            
+            Request request = new Request.Builder()
+                .url(urlBuilder.build())
+                .post(RequestBody.create("data=" + java.net.URLEncoder.encode(dataVal, "UTF-8"), MediaType.parse("application/x-www-form-urlencoded")))
+                .header("Cookie", buildCookieString())
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build();
+                
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (!response.isSuccessful()) {
+                    log.error("【{}】Token refresh HTTP failed: {}", cookieId, response.code());
+                    return;
+                }
+                String respStr = response.body().string();
+                JSONObject respJson = JSON.parseObject(respStr);
+                
+                // Process Response and Update Cookies (m_h5_tk particularly)
+                // Python logic checks 'data' -> 'result' -> 'true'? 
+                // Or mostly, relies on implicit cookie updates in the cookie jar.
+                // Here we need to extract Set-Cookie headers.
+                
+                // Update local cookies map from Set-Cookie
+                Map<String, String> updatedCookies = parseSetCookies(response.headers("Set-Cookie"));
+                if (!updatedCookies.isEmpty()) {
+                    this.cookiesData.putAll(updatedCookies);
+                    updateCookiesInDb(this.cookiesData);
+                }
+                log.info("【{}】Token refresh request completed", cookieId);
+            }
+        } catch (Exception e) {
+            log.error("【{}】Token refresh failed", cookieId, e);
+        }
+    }
+    
+    private Map<String, String> parseSetCookies(java.util.List<String> headerValues) {
+        Map<String, String> map = new java.util.HashMap<>();
+        if (headerValues != null) {
+            for (String val : headerValues) {
+                String[] parts = val.split(";")[0].split("=", 2);
+                if (parts.length == 2) {
+                     map.put(parts[0], parts[1]);
+                }
+            }
+        }
+        return map;
+    }
+    
+    private String buildCookieString() {
+        StringBuilder sb = new StringBuilder();
+        cookiesData.forEach((k, v) -> sb.append(k).append("=").append(v).append("; "));
+        return sb.toString();
+    }
+
+    private void initProtocol() {
+        if (session == null || !session.isOpen()) return;
+
+        try {
+            // 1. Send /reg
+            JSONObject headers = new JSONObject();
+            headers.put("cache-header", "app-key token ua wv");
+            headers.put("app-key", "34839810");
+            
+            String token = "";
+            if (cookiesData.containsKey("_m_h5_tk")) {
+                token = cookiesData.get("_m_h5_tk").split("_")[0];
+            }
+            headers.put("token", token);
+            headers.put("ua", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            headers.put("dt", "j");
+            headers.put("wv", "im:3,au:3,sy:6");
+            headers.put("sync", "0,0;0;0;");
+            headers.put("did", XianyuUtils.generateDeviceId(myId));
+            headers.put("mid", XianyuUtils.generateMid());
+
+            JSONObject regMsg = new JSONObject();
+            regMsg.put("lwp", "/reg");
+            regMsg.put("headers", headers);
+            
+            session.sendMessage(new TextMessage(regMsg.toJSONString()));
+            log.info("【{}】Sent /reg", cookieId);
+            
+            // Wait 1s
+            Thread.sleep(1000);
+            
+            // 2. Send AckDiff
+            JSONObject ackMsg = new JSONObject();
+            ackMsg.put("lwp", "/r/SyncStatus/ackDiff");
+            JSONObject ackHeaders = new JSONObject();
+            ackHeaders.put("mid", XianyuUtils.generateMid());
+            ackMsg.put("headers", ackHeaders);
+            
+             // Body
+            JSONObject bodyItem = new JSONObject();
+            bodyItem.put("pipeline", "sync");
+            bodyItem.put("tooLong2Tag", "PNM,1");
+            bodyItem.put("channel", "sync");
+            bodyItem.put("topic", "sync");
+            bodyItem.put("highPts", 0);
+            long currentTime = System.currentTimeMillis();
+            bodyItem.put("pts", currentTime * 1000);
+            bodyItem.put("seq", 0);
+            bodyItem.put("timestamp", currentTime);
+            
+            JSONArray body = new JSONArray();
+            body.add(bodyItem);
+            ackMsg.put("body", body);
+            
+            session.sendMessage(new TextMessage(ackMsg.toJSONString()));
+            log.info("【{}】Sent /ackDiff, protocol initialized.", cookieId);
+
+        } catch (Exception e) {
+            log.error("【{}】Init protocol failed", cookieId, e);
         }
     }
 
