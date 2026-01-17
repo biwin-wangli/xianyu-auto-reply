@@ -2,6 +2,7 @@ package com.xianyu.autoreply.service;
 
 import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.repository.CookieRepository;
+import com.xianyu.autoreply.service.captcha.CaptchaHandler;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,13 +18,16 @@ public class XianyuClientService {
 
     private final CookieRepository cookieRepository;
     private final ReplyService replyService;
+    private final CaptchaHandler captchaHandler;
     private final BrowserService browserService;
     private final Map<String, XianyuClient> clients = new ConcurrentHashMap<>();
 
     @Autowired
-    public XianyuClientService(CookieRepository cookieRepository, ReplyService replyService, BrowserService browserService) {
+    public XianyuClientService(CookieRepository cookieRepository, ReplyService replyService, 
+                               CaptchaHandler captchaHandler, BrowserService browserService) {
         this.cookieRepository = cookieRepository;
         this.replyService = replyService;
+        this.captchaHandler = captchaHandler;
         this.browserService = browserService;
     }
 
@@ -43,7 +47,7 @@ public class XianyuClientService {
             log.warn("Client {} already running", cookieId);
             return;
         }
-        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService, browserService);
+        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService, captchaHandler, browserService);
         clients.put(cookieId, client);
         client.start();
     }
