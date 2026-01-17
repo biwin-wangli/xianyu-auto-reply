@@ -190,13 +190,13 @@ public class QrLoginService {
                 
                 // 7. 获取会话状态
                 Map<String, Object> statusInfo = getSessionStatus(sessionId);
-                log.info("【QR Login】获取会话状态1111111: {}", statusInfo);
+                log.info("【QR Login】获取扫码状态信息: {}", statusInfo);
                 
                 String status = (String) statusInfo.get("status");
                 
                 // 8. 如果登录成功，处理Cookie
                 if ("success".equals(status)) {
-                    log.info("【QR Login】获取会话状态22222222: {}", statusInfo);
+                    log.info("【QR Login】扫码成功的状态信息: {}", statusInfo);
                     
                     // 获取会话Cookie信息
                     Map<String, String> cookiesInfo = getSessionCookies(sessionId);

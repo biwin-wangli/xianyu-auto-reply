@@ -47,8 +47,8 @@ public class XianyuClient extends TextWebSocketHandler {
     private static final String WEBSOCKET_URL = "wss://wss-goofish.dingtalk.com/";
     private static final int HEARTBEAT_INTERVAL = 30; // 心跳间隔（秒）
     private static final int HEARTBEAT_TIMEOUT = 90; // 心跳超时（秒）
-    private static final int TOKEN_REFRESH_INTERVAL = 3600; // Token刷新间隔（秒），1小时
-    private static final int TOKEN_RETRY_INTERVAL = 300; // Token重试间隔（秒），5分钟
+    private static final int TOKEN_REFRESH_INTERVAL = 72000; // Token刷新间隔（秒），1小时
+    private static final int TOKEN_RETRY_INTERVAL = 7200; // Token重试间隔（秒），5分钟
     private static final int MESSAGE_COOLDOWN = 300; // 消息冷却时间（秒），5分钟
     private static final int CLEANUP_INTERVAL = 300; // 清理间隔（秒），5分钟
     private static final int COOKIE_REFRESH_INTERVAL = 3600; // Cookie刷新间隔（秒），1小时
@@ -322,7 +322,7 @@ public class XianyuClient extends TextWebSocketHandler {
             }
         }
 
-        log.info("【{}】连接循环已退出", cookieId);
+        log.info("【{}】WebSocket 连接循环已退出", cookieId);
     }
 
 
@@ -577,7 +577,7 @@ public class XianyuClient extends TextWebSocketHandler {
                 } else {
                     log.info("【{}】开始刷新token...", cookieId);
                 }
-                lastTokenRefreshStatus = "started";
+                lastTokenRefreshStatus= "started";
 
                 // 检查是否在消息冷却期内
                 long currentTime = System.currentTimeMillis();

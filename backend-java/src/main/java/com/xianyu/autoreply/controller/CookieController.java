@@ -69,7 +69,7 @@ public class CookieController {
     public List<CookieDetailsResponse> getAllCookiesDetails(@RequestHeader(value = "Authorization", required = false) String token) {
         Long userId = getUserId(token);
         List<Cookie> userCookies = new ArrayList<>();
-        if (Objects.equals(1, userId)) {
+        if (Objects.equals(1L, userId)) {
             userCookies.addAll(cookieRepository.findAll());
         } else {
             // 获取当前用户的所有cookies
