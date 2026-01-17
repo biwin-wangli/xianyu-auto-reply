@@ -20,15 +20,20 @@ public class XianyuClientService {
     private final ReplyService replyService;
     private final CaptchaHandler captchaHandler;
     private final BrowserService browserService;
+    private final PauseManager pauseManager;
+    private final OrderStatusHandler orderStatusHandler;
     private final Map<String, XianyuClient> clients = new ConcurrentHashMap<>();
 
     @Autowired
     public XianyuClientService(CookieRepository cookieRepository, ReplyService replyService, 
-                               CaptchaHandler captchaHandler, BrowserService browserService) {
+                               CaptchaHandler captchaHandler, BrowserService browserService,
+                               PauseManager pauseManager, OrderStatusHandler orderStatusHandler) {
         this.cookieRepository = cookieRepository;
         this.replyService = replyService;
         this.captchaHandler = captchaHandler;
         this.browserService = browserService;
+        this.pauseManager = pauseManager;
+        this.orderStatusHandler = orderStatusHandler;
     }
 
     @PostConstruct
@@ -47,7 +52,8 @@ public class XianyuClientService {
             log.warn("Client {} already running", cookieId);
             return;
         }
-        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService, captchaHandler, browserService);
+        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService, 
+                                              captchaHandler, browserService, pauseManager, orderStatusHandler);
         clients.put(cookieId, client);
         client.start();
     }

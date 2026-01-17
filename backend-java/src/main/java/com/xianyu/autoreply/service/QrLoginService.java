@@ -484,7 +484,7 @@ public class QrLoginService {
     
     private Headers generateHeaders() {
         return new Headers.Builder()
-                .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0")
                 .add("Accept", "application/json, text/plain, */*")
                 .add("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
                 .add("Referer", "https://passport.goofish.com/")

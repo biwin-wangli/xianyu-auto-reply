@@ -22,10 +22,10 @@ spring:
     database-platform: org.hibernate.community.dialect.SQLiteDialect
     hibernate:
       ddl-auto: ${app.ddl-auto:update}
-    show-sql: true
+    show-sql: false # Set to false to disable SQL logging
     properties:
       hibernate:
-        format_sql: true
+        format_sql: false # Set to false to disable SQL formatting
 
   servlet:
     multipart:
@@ -36,5 +36,7 @@ logging:
   level:
     root: INFO
     com.xianyu.autoreply: DEBUG
+    org.hibernate.SQL: INFO # Ensure Hibernate SQL logging is not set to DEBUG/TRACE
+    org.hibernate.type.descriptor.sql: INFO # Ensure Hibernate parameter logging is not set to DEBUG/TRACE
   file:
     name: logs/backend-java.log
