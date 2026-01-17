@@ -26,7 +26,10 @@ public class BrowserService {
 
     private final CookieRepository cookieRepository;
     private Playwright playwright;
-    private Browser browser; 
+    private Browser browser;
+    
+    // 为每个账号维护持久化浏览器上下文（用于Cookie刷新）
+    private final Map<String, BrowserContext> persistentContexts = new ConcurrentHashMap<>(); 
 
     @Autowired
     public BrowserService(CookieRepository cookieRepository) {
@@ -74,6 +77,10 @@ public class BrowserService {
     @PreDestroy
     private void close() {
         log.info("Releasing Playwright resources...");
+        
+        // 关闭所有持久化上下文
+        closeAllPersistentContexts();
+        
         if (browser != null) {
             browser.close();
         }
@@ -493,111 +500,108 @@ public class BrowserService {
         return false;
     }
 
+    /**
+     * 刷新Cookie - 使用持久化浏览器上下文
+     * Cookie会自动保存到UserData目录，类似真实浏览器行为
+     */
     public Map<String, String> refreshCookies(String cookieId) {
-        log.info("【Cookie Refresh】Attempting to refresh cookies for id: {}", cookieId);
+        log.info("【Cookie Refresh】开始刷新Cookie for id: {}", cookieId);
         Cookie cookie = cookieRepository.findById(cookieId).orElse(null);
         if (cookie == null || cookie.getValue() == null) {
-             log.error("【Cookie Refresh】Cannot refresh. No valid cookie found for id: {}", cookieId);
+             log.error("【Cookie Refresh】无法刷新，Cookie不存在: {}", cookieId);
              return Collections.emptyMap();
         }
 
-        BrowserContext context = null;
+        Page page = null;
         try {
-            // Use a fresh context for each refresh to avoid pollution
-             Browser.NewContextOptions options = new Browser.NewContextOptions()
-                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .setViewportSize(1920, 1080);
+            // 1. 获取或创建持久化上下文（Cookie自动从UserData加载）
+            BrowserContext context = getPersistentContext(cookieId);
+            log.info("【Cookie Refresh】已获取持久化上下文: {}", cookieId);
             
-            context = browser.newContext(options);
-            
-            // 1. Parse and Set Cookies
-            List<com.microsoft.playwright.options.Cookie> playwrightCookies = new ArrayList<>();
-            String[] parts = cookie.getValue().split(";");
-            for (String part : parts) {
-                String[] kv = part.trim().split("=", 2);
-                if (kv.length == 2) {
-                     playwrightCookies.add(new com.microsoft.playwright.options.Cookie(kv[0], kv[1])
-                        .setDomain(".goofish.com")
-                        .setPath("/"));
-                }
-            }
-            context.addCookies(playwrightCookies);
-            log.info("【Cookie Refresh】Loaded {} cookies for {}", playwrightCookies.size(), cookieId);
-
-            // 2. Navigate and Refresh
-            Page page = context.newPage();
+            // 2. 创建新页面并访问闲鱼
+            page = context.newPage();
             addStealthScripts(page);
             
             String targetUrl = "https://www.goofish.com/im";
-            log.info("【Cookie Refresh】Navigating to {}", targetUrl);
+            log.info("【Cookie Refresh】导航到: {}", targetUrl);
             
             try {
-                page.navigate(targetUrl, new Page.NavigateOptions().setTimeout(15000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                page.navigate(targetUrl, new Page.NavigateOptions()
+                        .setTimeout(20000)
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
             } catch (Exception e) {
-                 log.warn("【Cookie Refresh】Navigation timeout, trying fallback...");
-                 try {
-                     page.navigate(targetUrl, new Page.NavigateOptions().setTimeout(25000).setWaitUntil(WaitUntilState.LOAD));
-                 } catch (Exception ex) {
-                     log.warn("【Cookie Refresh】Fallback navigation also timed out (proceeding anyway).");
-                 }
+                log.warn("【Cookie Refresh】导航超时，尝试降级...");
+                try {
+                    page.navigate(targetUrl, new Page.NavigateOptions()
+                            .setTimeout(30000)
+                            .setWaitUntil(WaitUntilState.LOAD));
+                } catch (Exception ex) {
+                    log.warn("【Cookie Refresh】降级导航也超时，继续执行");
+                }
             }
 
-            // Wait for page load
+            // 3. 等待页面加载
+            try { Thread.sleep(3000); } catch (Exception e) {}
+
+            // 4. 重新加载页面以触发Cookie刷新
+            log.info("【Cookie Refresh】重新加载页面...");
+            try {
+                 page.reload(new Page.ReloadOptions()
+                         .setTimeout(20000)
+                         .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+            } catch (Exception e) {
+                 log.warn("【Cookie Refresh】重新加载超时，继续执行");
+            }
             try { Thread.sleep(2000); } catch (Exception e) {}
 
-            // Reload to force refresh
-            log.info("【Cookie Refresh】Reloading page...");
-            try {
-                 page.reload(new Page.ReloadOptions().setTimeout(15000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
-            } catch (Exception e) {
-                 log.warn("【Cookie Refresh】Reload timeout (proceeding anyway).");
-            }
-            try { Thread.sleep(1000); } catch (Exception e) {}
-
-            // 3. Capture New Cookies
+            // 5. 获取刷新后的Cookie（从持久化上下文中获取）
             List<com.microsoft.playwright.options.Cookie> newCookies = context.cookies();
-            log.info("【Cookie Refresh】Captured {} cookies after refresh.", newCookies.size());
+            log.info("【Cookie Refresh】获取到 {} 个Cookie", newCookies.size());
             
-            // 4. Compare and Update
+            // 6. 构建Cookie Map
             Map<String, String> newCookieMap = new HashMap<>();
             for (com.microsoft.playwright.options.Cookie c : newCookies) {
                 newCookieMap.put(c.name, c.value);
             }
             
-            // Simple check if unb exists
+            // 7. 验证必要Cookie
             if (!newCookieMap.containsKey("unb")) {
-                 log.warn("【Cookie Refresh】'unb' missing in refreshed cookies. Refresh might have failed or session invalid.");
+                 log.warn("【Cookie Refresh】刷新后的Cookie缺少'unb'字段，可能已失效");
                  return Collections.emptyMap();
             }
 
-            // Construct new cookie string
+            // 8. 构建Cookie字符串并保存到数据库
             StringBuilder sb = new StringBuilder();
             for (Map.Entry<String, String> entry : newCookieMap.entrySet()) {
                 sb.append(entry.getKey()).append("=").append(entry.getValue()).append("; ");
             }
             String newCookieStr = sb.toString();
             
-            // Check for changes (Logic similar to Python's check)
-            // For now, we update if string is different, or if we want to be robust, we just save.
-            // Python checks if keys changed or values changed.
-            // Let's just save to be safe and ensure "last updated" is fresh if DB has such field.
-            
+            // 9. 更新数据库
             if (!newCookieStr.equals(cookie.getValue())) {
                 cookie.setValue(newCookieStr);
                 cookieRepository.save(cookie);
-                log.info("【Cookie Refresh】Cookies updated and saved to DB for {}", cookieId);
-                return newCookieMap;
+                log.info("【Cookie Refresh】✅ Cookie已更新并保存到数据库: {}", cookieId);
             } else {
-                 log.info("【Cookie Refresh】Cookies identical, no DB update needed.");
-                 return newCookieMap;
+                log.info("【Cookie Refresh】Cookie未变化，无需更新数据库");
             }
+            
+            // 10. Cookie已自动保存到UserData目录（持久化）
+            log.info("【Cookie Refresh】✅ Cookie刷新完成（已持久化到磁盘）: {}", cookieId);
+            return newCookieMap;
 
         } catch (Exception e) {
-            log.error("【Cookie Refresh】Exception during refresh for {}", cookieId, e);
+            log.error("【Cookie Refresh】❌ 刷新Cookie异常: {}", cookieId, e);
             return Collections.emptyMap();
         } finally {
-            if (context != null) {
-                try { context.close(); } catch (Exception e) { log.error("Error closing context", e); }
+            // 关闭页面但保持上下文（保持持久化状态）
+            if (page != null) {
+                try {
+                    page.close();
+                    log.debug("【Cookie Refresh】页面已关闭: {}", cookieId);
+                } catch (Exception e) {
+                    log.error("【Cookie Refresh】关闭页面失败", e);
+                }
             }
         }
     }
@@ -667,7 +671,128 @@ public class BrowserService {
         return null; // Failed
     }
 
-
+    // ================== 持久化浏览器上下文管理 ==================
+    
+    /**
+     * 获取或创建账号的持久化浏览器上下文
+     * 使用持久化上下文可以将Cookie保存到磁盘，类似真实浏览器行为
+     */
+    private BrowserContext getPersistentContext(String cookieId) {
+        // 如果已存在，直接返回
+        BrowserContext existingContext = persistentContexts.get(cookieId);
+        if (existingContext != null) {
+            try {
+                // 验证上下文是否仍然有效
+                existingContext.pages();
+                log.debug("【Cookie Refresh】复用已存在的持久化上下文: {}", cookieId);
+                return existingContext;
+            } catch (Exception e) {
+                // 上下文已失效，移除并重新创建
+                log.warn("【Cookie Refresh】持久化上下文已失效，重新创建: {}", cookieId);
+                persistentContexts.remove(cookieId);
+            }
+        }
+        
+        // 创建新的持久化上下文
+        try {
+            String userDataDir = "browser_data/cookie_refresh/" + cookieId;
+            java.nio.file.Path userDataPath = java.nio.file.Paths.get(userDataDir);
+            
+            // 确保目录存在
+            java.nio.file.Files.createDirectories(userDataPath);
+            log.info("【Cookie Refresh】创建UserData目录: {}", userDataDir);
+            
+            // 配置启动选项
+            List<String> args = new ArrayList<>();
+            args.add("--no-sandbox");
+            args.add("--disable-setuid-sandbox");
+            args.add("--disable-dev-shm-usage");
+            args.add("--disable-gpu");
+            args.add("--disable-blink-features=AutomationControlled");
+            args.add("--lang=zh-CN");
+            
+            BrowserType.LaunchPersistentContextOptions options = new BrowserType.LaunchPersistentContextOptions()
+                    .setHeadless(true)
+                    .setArgs(args)
+                    .setViewportSize(1920, 1080)
+                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                    .setLocale("zh-CN")
+                    .setAcceptDownloads(false)
+                    .setIgnoreHTTPSErrors(true);
+            
+            // macOS ARM架构特殊处理
+            String osName = System.getProperty("os.name").toLowerCase();
+            String osArch = System.getProperty("os.arch").toLowerCase();
+            if (osName.contains("mac") && osArch.contains("aarch64")) {
+                Path chromePath = Paths.get("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+                if (chromePath.toFile().exists()) {
+                    options.setExecutablePath(chromePath);
+                }
+            }
+            
+            log.info("【Cookie Refresh】创建持久化浏览器上下文: {}", cookieId);
+            BrowserContext context = playwright.chromium().launchPersistentContext(userDataPath, options);
+            
+            // 首次创建时，需要设置Cookie
+            Cookie cookie = cookieRepository.findById(cookieId).orElse(null);
+            if (cookie != null && cookie.getValue() != null) {
+                // 解析并添加Cookie
+                List<com.microsoft.playwright.options.Cookie> playwrightCookies = new ArrayList<>();
+                String[] parts = cookie.getValue().split(";");
+                for (String part : parts) {
+                    String[] kv = part.trim().split("=", 2);
+                    if (kv.length == 2) {
+                        playwrightCookies.add(new com.microsoft.playwright.options.Cookie(kv[0], kv[1])
+                                .setDomain(".goofish.com")
+                                .setPath("/"));
+                    }
+                }
+                context.addCookies(playwrightCookies);
+                log.info("【Cookie Refresh】已设置初始Cookie: {} 个", playwrightCookies.size());
+            }
+            
+            // 缓存上下文
+            persistentContexts.put(cookieId, context);
+            
+            return context;
+            
+        } catch (Exception e) {
+            log.error("【Cookie Refresh】创建持久化上下文失败: {}", cookieId, e);
+            throw new RuntimeException("创建持久化浏览器上下文失败", e);
+        }
+    }
+    
+    /**
+     * 关闭指定账号的持久化上下文
+     */
+    public void closePersistentContext(String cookieId) {
+        BrowserContext context = persistentContexts.remove(cookieId);
+        if (context != null) {
+            try {
+                context.close();
+                log.info("【Cookie Refresh】已关闭持久化上下文: {}", cookieId);
+            } catch (Exception e) {
+                log.error("【Cookie Refresh】关闭持久化上下文失败: {}", cookieId, e);
+            }
+        }
+    }
+    
+    /**
+     * 关闭所有持久化上下文
+     */
+    private void closeAllPersistentContexts() {
+        log.info("【Cookie Refresh】关闭所有持久化上下文...");
+        for (Map.Entry<String, BrowserContext> entry : persistentContexts.entrySet()) {
+            try {
+                entry.getValue().close();
+                log.info("【Cookie Refresh】已关闭: {}", entry.getKey());
+            } catch (Exception e) {
+                log.error("【Cookie Refresh】关闭失败: {}", entry.getKey(), e);
+            }
+        }
+        persistentContexts.clear();
+    }
+    
 
     private void addStealthScripts(Page page) {
         page.addInitScript(BrowserStealth.STEALTH_SCRIPT);

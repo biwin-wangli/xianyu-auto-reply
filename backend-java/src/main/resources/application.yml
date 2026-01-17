@@ -1,3 +1,6 @@
+app:
+  ddl-auto: update # valid values: none, validate, update, create, create-drop
+
 server:
   port: 8080
 
@@ -7,14 +10,18 @@ spring:
 
   datasource:
     driver-class-name: org.sqlite.JDBC
-    url: jdbc:sqlite:../data/xianyu_data.db
+    url: jdbc:sqlite:./db/xianyu_data.db
     username: 
     password: 
+
+  sql:
+    init:
+      mode: never
 
   jpa:
     database-platform: org.hibernate.community.dialect.SQLiteDialect
     hibernate:
-      ddl-auto: update
+      ddl-auto: ${app.ddl-auto:update}
     show-sql: true
     properties:
       hibernate:

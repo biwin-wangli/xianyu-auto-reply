@@ -29,6 +29,11 @@ public class QrLoginService {
     private final Map<String, QrLoginSession> sessions = new ConcurrentHashMap<>();
     private final OkHttpClient client;
     private final ObjectMapper objectMapper;
+    
+    // 并发锁机制 - 防止同一session的并发处理
+    private final Map<String, Object> qrCheckLocks = new ConcurrentHashMap<>();
+    // 已处理记录 - 记录已完成处理的session
+    private final Map<String, ProcessedRecord> qrCheckProcessed = new ConcurrentHashMap<>();
 
     @Autowired
     public QrLoginService(CookieRepository cookieRepository, BrowserService browserService) {
@@ -54,9 +59,23 @@ public class QrLoginService {
         private String verificationUrl;
         private Map<String, String> params = new HashMap<>(); // Store login params (t, ck, etc.)
         private Map<String, String> cookies = new HashMap<>();
+        private String accountId; // 保存处理后的账号ID
+        private boolean isNewAccount; // 是否为新账号
+        private boolean realCookieRefreshed; // 是否成功刷新真实Cookie
 
         public boolean isExpired() {
             return System.currentTimeMillis() - createdTime > expireTime;
+        }
+    }
+    
+    @Data
+    public static class ProcessedRecord {
+        private boolean processed;
+        private long timestamp;
+        
+        public ProcessedRecord(boolean processed, long timestamp) {
+            this.processed = processed;
+            this.timestamp = timestamp;
         }
     }
 
@@ -133,51 +152,84 @@ public class QrLoginService {
     }
     
     public Map<String, Object> checkQrCodeStatus(String sessionId) {
-        QrLoginSession session = sessions.get(sessionId);
-        if (session == null) {
-            return Map.of("status", "not_found", "message", "会话不存在或已过期");
-        }
-        
-        if (session.isExpired() && !"success".equals(session.getStatus())) {
-            session.setStatus("expired");
-            return Map.of("status", "expired", "session_id", sessionId);
-        }
-        
-        // If already successful, return stored result
-        if ("success".equals(session.getStatus()) && session.getUnb() != null) {
-             return buildSuccessResult(session);
-        }
-
-        // Poll status from API
         try {
-            pollQrCodeStatus(session);
+            // 1. 清理过期记录
+            cleanupQrCheckRecords();
+            
+            // 2. 检查是否已经处理过
+            ProcessedRecord processedRecord = qrCheckProcessed.get(sessionId);
+            if (processedRecord != null && processedRecord.isProcessed()) {
+                log.debug("【QR Login】扫码登录session {} 已处理过，直接返回", sessionId);
+                return Map.of("status", "already_processed", "message", "该会话已处理完成");
+            }
+            
+            // 3. 获取或创建该session的锁对象
+            Object sessionLock = qrCheckLocks.computeIfAbsent(sessionId, k -> new Object());
+            
+            // 4. 尝试获取锁（使用tryLock模式，避免阻塞）
+            boolean lockAcquired = false;
+            synchronized (sessionLock) {
+                // 检查锁状态（在Java中我们用一个简单的标记）
+                // 如果已经有线程在处理，直接返回processing
+                if (Thread.holdsLock(sessionLock)) {
+                    lockAcquired = true;
+                }
+            }
+            
+            // 使用synchronized块确保同一session不会被并发处理
+            synchronized (sessionLock) {
+                // 5. 双重检查 - 再次确认是否已处理
+                processedRecord = qrCheckProcessed.get(sessionId);
+                if (processedRecord != null && processedRecord.isProcessed()) {
+                    log.debug("【QR Login】扫码登录session {} 在获取锁后发现已处理，直接返回", sessionId);
+                    return Map.of("status", "already_processed", "message", "该会话已处理完成");
+                }
+                
+                // 6. 清理过期会话
+                cleanupExpiredSessions();
+                
+                // 7. 获取会话状态
+                Map<String, Object> statusInfo = getSessionStatus(sessionId);
+                log.info("【QR Login】获取会话状态1111111: {}", statusInfo);
+                
+                String status = (String) statusInfo.get("status");
+                
+                // 8. 如果登录成功，处理Cookie
+                if ("success".equals(status)) {
+                    log.info("【QR Login】获取会话状态22222222: {}", statusInfo);
+                    
+                    // 获取会话Cookie信息
+                    Map<String, String> cookiesInfo = getSessionCookies(sessionId);
+                    log.info("【QR Login】获取会话Cookie: {}", cookiesInfo);
+                    
+                    if (cookiesInfo != null && !cookiesInfo.isEmpty()) {
+                        // 处理扫码登录Cookie
+                        Map<String, Object> accountInfo = processQrLoginCookies(
+                            cookiesInfo.get("cookies"),
+                            cookiesInfo.get("unb")
+                        );
+                        
+                        // 将账号信息添加到返回结果中
+                        statusInfo.put("account_info", accountInfo);
+                        
+                        log.info("【QR Login】扫码登录处理完成: {}, 账号: {}", 
+                            sessionId, accountInfo.get("account_id"));
+                        
+                        // 9. 标记该session已处理
+                        qrCheckProcessed.put(sessionId, new ProcessedRecord(true, System.currentTimeMillis()));
+                    }
+                }
+                
+                return statusInfo;
+            }
+            
         } catch (Exception e) {
-            log.error("【QR Login】Error polling status for {}", sessionId, e);
+            log.error("【QR Login】检查扫码登录状态异常: {}", e.getMessage(), e);
+            Map<String, Object> errorResult = new HashMap<>();
+            errorResult.put("status", "error");
+            errorResult.put("message", e.getMessage());
+            return errorResult;
         }
-
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", session.getStatus());
-        result.put("session_id", sessionId);
-        
-        if ("verification_required".equals(session.getStatus())) {
-            result.put("verification_url", session.getVerificationUrl());
-            result.put("message", "账号被风控，需要手机验证");
-        }
-        
-        if ("success".equals(session.getStatus())) {
-             log.info("【QR Login】Status confirmed SUCCESS. Starting post-login processing for UNB: {}", session.getUnb());
-             
-             try {
-                processLoginSuccess(session);
-                return buildSuccessResult(session);
-             } catch (Exception e) {
-                 log.error("【QR Login】Error during post-login processing", e);
-                 result.put("status", "error");
-                 result.put("message", "登录后处理失败: " + e.getMessage());
-             }
-        }
-        
-        return result;
     }
     
     private void processLoginSuccess(QrLoginSession session) {
@@ -481,5 +533,232 @@ public class QrLoginService {
             }
             return validCookies;
         }
+    }
+    
+    // --- 清理和工具方法 ---
+    
+    /**
+     * 清理过期的扫码检查记录（超过1小时）
+     */
+    private void cleanupQrCheckRecords() {
+        long currentTime = System.currentTimeMillis();
+        List<String> expiredSessions = new ArrayList<>();
+        
+        for (Map.Entry<String, ProcessedRecord> entry : qrCheckProcessed.entrySet()) {
+            // 清理超过1小时的记录
+            if (currentTime - entry.getValue().getTimestamp() > 3600 * 1000) {
+                expiredSessions.add(entry.getKey());
+            }
+        }
+        
+        for (String sessionId : expiredSessions) {
+            qrCheckProcessed.remove(sessionId);
+            qrCheckLocks.remove(sessionId);
+            log.debug("【QR Login】清理过期的扫码检查记录: {}", sessionId);
+        }
+    }
+    
+    /**
+     * 清理过期的登录会话
+     */
+    private void cleanupExpiredSessions() {
+        List<String> expiredSessions = new ArrayList<>();
+        
+        for (Map.Entry<String, QrLoginSession> entry : sessions.entrySet()) {
+            if (entry.getValue().isExpired()) {
+                expiredSessions.add(entry.getKey());
+            }
+        }
+        
+        for (String sessionId : expiredSessions) {
+            sessions.remove(sessionId);
+            log.info("【QR Login】清理过期会话: {}", sessionId);
+        }
+    }
+    
+    /**
+     * 获取会话状态（包含轮询API）
+     */
+    private Map<String, Object> getSessionStatus(String sessionId) {
+        QrLoginSession session = sessions.get(sessionId);
+        if (session == null) {
+            return Map.of("status", "not_found", "message", "会话不存在或已过期");
+        }
+        
+        if (session.isExpired() && !"success".equals(session.getStatus())) {
+            session.setStatus("expired");
+            return Map.of("status", "expired", "session_id", sessionId);
+        }
+        
+        // 如果已经成功，直接返回
+        if ("success".equals(session.getStatus()) && session.getUnb() != null) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("status", "success");
+            result.put("session_id", sessionId);
+            return result;
+        }
+        
+        // 轮询状态
+        try {
+            pollQrCodeStatus(session);
+        } catch (Exception e) {
+            log.error("【QR Login】轮询状态失败 for {}", sessionId, e);
+        }
+        
+        Map<String, Object> result = new HashMap<>();
+        result.put("status", session.getStatus());
+        result.put("session_id", sessionId);
+        
+        if ("verification_required".equals(session.getStatus())) {
+            result.put("verification_url", session.getVerificationUrl());
+            result.put("message", "账号被风控，需要手机验证");
+        }
+        
+        return result;
+    }
+    
+    /**
+     * 获取会话Cookie信息
+     */
+    private Map<String, String> getSessionCookies(String sessionId) {
+        QrLoginSession session = sessions.get(sessionId);
+        if (session != null && "success".equals(session.getStatus())) {
+            Map<String, String> result = new HashMap<>();
+            
+            // 将Cookie转换为字符串
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> entry : session.getCookies().entrySet()) {
+                sb.append(entry.getKey()).append("=").append(entry.getValue()).append("; ");
+            }
+            
+            result.put("cookies", sb.toString());
+            result.put("unb", session.getUnb());
+            return result;
+        }
+        return null;
+    }
+    
+    /**
+     * 处理扫码登录Cookie - 对应Python的process_qr_login_cookies方法
+     */
+    private Map<String, Object> processQrLoginCookies(String cookies, String unb) {
+        try {
+            log.info("【QR Login】开始处理扫码登录Cookie, UNB: {}", unb);
+            
+            // 1. 检查是否已存在相同unb的账号
+            String existingAccountId = null;
+            boolean isNewAccount = true;
+            
+            // 遍历数据库中的所有Cookie，查找是否有相同的unb
+            Iterable<com.xianyu.autoreply.entity.Cookie> allCookies = cookieRepository.findAll();
+            for (com.xianyu.autoreply.entity.Cookie cookieEntity : allCookies) {
+                String cookieValue = cookieEntity.getValue();
+                if (cookieValue != null && cookieValue.contains("unb=" + unb)) {
+                    existingAccountId = cookieEntity.getId();
+                    isNewAccount = false;
+                    log.info("【QR Login】扫码登录找到现有账号: {}, UNB: {}", existingAccountId, unb);
+                    break;
+                }
+            }
+            
+            // 2. 确定账号ID
+            String accountId;
+            if (existingAccountId != null) {
+                accountId = existingAccountId;
+            } else {
+                // 创建新账号，使用unb作为账号ID
+                accountId = unb;
+                
+                // 确保账号ID唯一
+                int counter = 1;
+                String originalAccountId = accountId;
+                while (cookieRepository.existsById(accountId)) {
+                    accountId = originalAccountId + "_" + counter;
+                    counter++;
+                }
+                
+                log.info("【QR Login】扫码登录准备创建新账号: {}, UNB: {}", accountId, unb);
+            }
+            
+            // 3. 使用浏览器服务验证并刷新Cookie（获取真实Cookie）
+            log.info("【QR Login】开始使用扫码cookie获取真实cookie: {}", accountId);
+            
+            boolean realCookieRefreshed = false;
+            String finalCookieStr = cookies;
+            
+            try {
+                // 调用BrowserService验证并获取真实Cookie
+                Map<String, String> verifiedCookies = browserService.verifyQrLoginCookies(
+                    parseCookieString(cookies), 
+                    accountId
+                );
+                
+                if (verifiedCookies != null && !verifiedCookies.isEmpty()) {
+                    log.info("【QR Login】浏览器验证成功，获取到真实Cookie，数量: {}", verifiedCookies.size());
+                    
+                    // 将Cookie转换为字符串
+                    StringBuilder sb = new StringBuilder();
+                    for (Map.Entry<String, String> entry : verifiedCookies.entrySet()) {
+                        sb.append(entry.getKey()).append("=").append(entry.getValue()).append("; ");
+                    }
+                    finalCookieStr = sb.toString();
+                    realCookieRefreshed = true;
+                } else {
+                    log.warn("【QR Login】浏览器验证失败，使用原始扫码Cookie");
+                }
+            } catch (Exception e) {
+                log.error("【QR Login】获取真实Cookie异常: {}", e.getMessage(), e);
+                log.warn("【QR Login】降级处理 - 使用原始扫码Cookie");
+            }
+            
+            // 4. 保存Cookie到数据库
+            com.xianyu.autoreply.entity.Cookie cookieEntity = cookieRepository.findById(accountId)
+                    .orElse(new com.xianyu.autoreply.entity.Cookie());
+            
+            cookieEntity.setId(accountId);
+            cookieEntity.setValue(finalCookieStr);
+            
+            if (isNewAccount) {
+                cookieEntity.setUsername("TB_" + unb);
+                cookieEntity.setPassword("QR_LOGIN");
+                cookieEntity.setUserId(0L);
+            }
+            
+            cookieEntity.setEnabled(true);
+            cookieRepository.save(cookieEntity);
+            
+            log.info("【QR Login】Cookie已保存到数据库: {}, 是否新账号: {}, 真实Cookie刷新: {}", 
+                accountId, isNewAccount, realCookieRefreshed);
+            
+            // 5. 构建返回结果
+            Map<String, Object> result = new HashMap<>();
+            result.put("account_id", accountId);
+            result.put("is_new_account", isNewAccount);
+            result.put("real_cookie_refreshed", realCookieRefreshed);
+            result.put("cookie_length", finalCookieStr.length());
+            
+            return result;
+            
+        } catch (Exception e) {
+            log.error("【QR Login】处理扫码登录Cookie失败: {}", e.getMessage(), e);
+            throw new RuntimeException("处理扫码登录Cookie失败: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 解析Cookie字符串为Map
+     */
+    private Map<String, String> parseCookieString(String cookieStr) {
+        Map<String, String> cookieMap = new HashMap<>();
+        if (cookieStr != null && !cookieStr.isEmpty()) {
+            String[] pairs = cookieStr.split(";\\s*");
+            for (String pair : pairs) {
+                String[] kv = pair.split("=", 2);
+                if (kv.length == 2) {
+                    cookieMap.put(kv[0].trim(), kv[1].trim());
+                }
+            }
+        }
+        return cookieMap;
     }
 }

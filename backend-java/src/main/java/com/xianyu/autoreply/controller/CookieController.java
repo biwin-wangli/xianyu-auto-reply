@@ -12,8 +12,10 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -59,18 +61,41 @@ public class CookieController {
         return cookieRepository.findByUserId(userId);
     }
 
+    /**
+     * 获取所有Cookie的详细信息（包括值和状态）
+     * 对应Python的 get_cookies_details 接口
+     */
     @GetMapping("/details")
-    public List<Cookie> getAllCookiesDetails(@RequestHeader(value = "Authorization", required = false) String token) {
-        return listCookies(token);
+    public List<CookieDetailsResponse> getAllCookiesDetails(@RequestHeader(value = "Authorization", required = false) String token) {
+        Long userId = getUserId(token);
+        List<Cookie> userCookies = new ArrayList<>();
+        if (Objects.equals(1, userId)) {
+            userCookies.addAll(cookieRepository.findAll());
+        } else {
+            // 获取当前用户的所有cookies
+            userCookies.addAll(cookieRepository.findByUserId(userId));
+        }
+
+        // 构建详细信息响应
+        return userCookies.stream().map(cookie -> {
+            CookieDetailsResponse response = new CookieDetailsResponse();
+            response.setId(cookie.getId());
+            response.setValue(cookie.getValue());
+            response.setEnabled(cookie.getEnabled());
+            response.setAutoConfirm(cookie.getAutoConfirm());
+            response.setRemark(cookie.getRemark() != null ? cookie.getRemark() : "");
+            response.setPauseDuration(cookie.getPauseDuration() != null ? cookie.getPauseDuration() : 10);
+            return response;
+        }).collect(Collectors.toList());
     }
 
     @PostMapping
     public Cookie addCookie(@RequestBody CookieIn cookieIn, @RequestHeader(value = "Authorization", required = false) String token) {
         Long userId = getUserId(token);
-        
+
         // Check if ID exists
         if (cookieRepository.existsById(cookieIn.getId())) {
-             throw new RuntimeException("Cookie ID already exists");
+            throw new RuntimeException("Cookie ID already exists");
         }
 
         Cookie cookie = new Cookie();
@@ -96,7 +121,7 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookie.setValue(cookieIn.getValue());
         cookie.setUpdatedAt(LocalDateTime.now());
         cookieRepository.save(cookie);
@@ -108,7 +133,7 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookieRepository.deleteById(id);
     }
 
@@ -128,11 +153,11 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         if (update.getUsername() != null) cookie.setUsername(update.getUsername());
         if (update.getPassword() != null) cookie.setPassword(update.getPassword());
         if (update.getShowBrowser() != null) cookie.setShowBrowser(update.getShowBrowser() ? 1 : 0);
-        
+
         return cookieRepository.save(cookie);
     }
 
@@ -142,7 +167,7 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookie.setPauseDuration(update.getPauseDuration());
         return cookieRepository.save(cookie);
     }
@@ -161,7 +186,7 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookie.setAutoConfirm(update.isAutoConfirm() ? 1 : 0);
         return cookieRepository.save(cookie);
     }
@@ -180,7 +205,7 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookie.setRemark(update.getRemark());
         return cookieRepository.save(cookie);
     }
@@ -199,20 +224,20 @@ public class CookieController {
         Long userId = getUserId(token);
         Cookie cookie = cookieRepository.findById(id).orElseThrow(() -> new RuntimeException("Cookie not found"));
         checkOwnership(cookie, userId);
-        
+
         cookie.setEnabled(update.isEnabled());
         cookieRepository.save(cookie);
         // Start/Stop client logic placeholder
         return cookie;
     }
-    
+
     // cookies/check - Usually global validation or test, Python Line 4340
     @GetMapping("/check")
     public Map<String, Object> checkCookies(@RequestHeader(value = "Authorization", required = false) String token) {
         Long userId = getUserId(token);
         // Logic to check validity of user's cookies.
         // For now, return stub or call BrowserService if needed.
-        return Map.of("status", "checked", "count", 0); 
+        return Map.of("status", "checked", "count", 0);
     }
 
     // DTOs with JSON Properties
@@ -249,6 +274,21 @@ public class CookieController {
 
     @Data
     public static class PauseDurationUpdate {
+        @JsonProperty("pause_duration")
+        private Integer pauseDuration;
+    }
+
+    /**
+     * Cookie详细信息响应 - 对应Python的 get_cookies_details 返回格式
+     */
+    @Data
+    public static class CookieDetailsResponse {
+        private String id;
+        private String value;
+        private Boolean enabled;
+        @JsonProperty("auto_confirm")
+        private Integer autoConfirm;
+        private String remark;
         @JsonProperty("pause_duration")
         private Integer pauseDuration;
     }
