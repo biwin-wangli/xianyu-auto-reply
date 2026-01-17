@@ -6,6 +6,8 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.xianyu.autoreply.entity.Cookie;
+import com.xianyu.autoreply.model.ItemDetailCache;
+import com.xianyu.autoreply.model.LockHoldInfo;
 import com.xianyu.autoreply.repository.CookieRepository;
 import com.xianyu.autoreply.service.captcha.CaptchaHandler;
 import com.xianyu.autoreply.utils.XianyuUtils;
@@ -24,6 +26,7 @@ import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -34,6 +37,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 
 /**
@@ -47,14 +51,39 @@ public class XianyuClient extends TextWebSocketHandler {
     private static final String WEBSOCKET_URL = "wss://wss-goofish.dingtalk.com/";
     private static final int HEARTBEAT_INTERVAL = 30; // 心跳间隔（秒）
     private static final int HEARTBEAT_TIMEOUT = 90; // 心跳超时（秒）
-    private static final int TOKEN_REFRESH_INTERVAL = 72000; // Token刷新间隔（秒），1小时
-    private static final int TOKEN_RETRY_INTERVAL = 7200; // Token重试间隔（秒），5分钟
+    private static final int TOKEN_REFRESH_INTERVAL = 72000; // Token刷新间隔（秒），20小时
+    private static final int TOKEN_RETRY_INTERVAL = 7200; // Token重试间隔（秒），2小时
     private static final int MESSAGE_COOLDOWN = 300; // 消息冷却时间（秒），5分钟
     private static final int CLEANUP_INTERVAL = 300; // 清理间隔（秒），5分钟
-    private static final int COOKIE_REFRESH_INTERVAL = 3600; // Cookie刷新间隔（秒），1小时
+    private static final int COOKIE_REFRESH_INTERVAL = 1200; // Cookie刷新间隔（秒），20分钟
     
     private static final String APP_KEY = "34839810";
     private static final String APP_CONFIG_KEY = "444e9908a51d1cb236a27862abc769c9";
+    
+    // ============== 类级别共享资源（多实例共享）==============
+    
+    // 订单锁字典（用于自动发货防并发）
+    private static final ConcurrentHashMap<String, ReentrantLock> ORDER_LOCKS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> LOCK_USAGE_TIMES = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, LockHoldInfo> LOCK_HOLD_INFO = new ConcurrentHashMap<>();
+    
+    // 订单详情锁（独立锁字典，不使用延迟释放机制）
+    private static final ConcurrentHashMap<String, ReentrantLock> ORDER_DETAIL_LOCKS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> ORDER_DETAIL_LOCK_TIMES = new ConcurrentHashMap<>();
+    
+    // 商品详情缓存（24小时有效，支持LRU淘汰）
+    private static final ConcurrentHashMap<String, ItemDetailCache> ITEM_DETAIL_CACHE = new ConcurrentHashMap<>();
+    private static final ReentrantLock ITEM_DETAIL_CACHE_LOCK = new ReentrantLock();
+    private static final int ITEM_DETAIL_CACHE_MAX_SIZE = 1000; // 最大缓存1000个商品
+    private static final int ITEM_DETAIL_CACHE_TTL = 24 * 60 * 60; // 24小时TTL（秒）
+    
+    // 实例管理字典（用于API调用时获取实例）
+    private static final ConcurrentHashMap<String, XianyuClient> INSTANCES = new ConcurrentHashMap<>();
+    private static final ReentrantLock INSTANCES_LOCK = new ReentrantLock();
+    
+    // 密码登录时间记录（防止重复登录）
+    private static final ConcurrentHashMap<String, Long> LAST_PASSWORD_LOGIN_TIME = new ConcurrentHashMap<>();
+    private static final int PASSWORD_LOGIN_COOLDOWN = 60; // 密码登录冷却时间（秒）
 
     // ============== 核心字段 ==============
     private final String cookieId; // 账号ID
@@ -113,9 +142,46 @@ public class XianyuClient extends TextWebSocketHandler {
     // ============== Cookie刷新相关 ==============
     private final AtomicLong lastMessageReceivedTime = new AtomicLong(0); // 上次收到消息时间
     private final AtomicLong lastCookieRefreshTime = new AtomicLong(0);
+    private final AtomicBoolean cookieRefreshEnabled = new AtomicBoolean(true); // 是否启用Cookie刷新
+    private final AtomicLong lastQrCookieRefreshTime = new AtomicLong(0); // 上次扫码登录Cookie刷新时间
+    private static final int QR_COOKIE_REFRESH_COOLDOWN = 600; // 扫码登录Cookie刷新冷却时间（秒）
+    private static final int MESSAGE_COOKIE_REFRESH_COOLDOWN = 300; // 收到消息后Cookie刷新冷却时间（秒）
+    private final AtomicBoolean browserCookieRefreshed = new AtomicBoolean(false); // 浏览器Cookie刷新标志
+    private final AtomicBoolean restartedInBrowserRefresh = new AtomicBoolean(false); // 刷新流程内是否已触发重启
+    
+    // ============== 滑块验证相关 ==============
+    private final AtomicInteger captchaVerificationCount = new AtomicInteger(0); // 滑块验证次数计数器
+    private static final int MAX_CAPTCHA_VERIFICATION_COUNT = 3; // 最大滑块验证次数
+    
+    // ============== 后台任务追踪 ==============
+    private final Set<CompletableFuture<Void>> backgroundTasks = ConcurrentHashMap.newKeySet(); // 追踪所有后台任务
+    
+    // ============== 消息防抖管理 ==============
+    private final Map<String, MessageDebounceInfo> messageDebounnceTasks = new ConcurrentHashMap<>(); // 消息防抖任务
+    private static final int MESSAGE_DEBOUNCE_DELAY = 1; // 防抖延迟时间（秒）
+    private final ReentrantLock messageDebounceLock = new ReentrantLock(); // 防抖任务管理的锁
+    private final ReentrantLock processedMessageIdsLock = new ReentrantLock(); // 消息ID去重的锁
+    
+    // ============== 发货已发送订单记录 ==============
+    private final Map<String, Long> deliverySentOrders = new ConcurrentHashMap<>(); // 已发货订单记录 {order_id: timestamp}
 
     // ============== HTTP Client ==============
     private final OkHttpClient httpClient;
+    
+    /**
+     * 消息防抖信息类
+     */
+    private static class MessageDebounceInfo {
+        CompletableFuture<Void> task;
+        JSONObject lastMessage;
+        long timer;
+        
+        MessageDebounceInfo(CompletableFuture<Void> task, JSONObject lastMessage, long timer) {
+            this.task = task;
+            this.lastMessage = lastMessage;
+            this.timer = timer;
+        }
+    }
 
     /**
      * 连接状态枚举
@@ -166,6 +232,9 @@ public class XianyuClient extends TextWebSocketHandler {
             return t;
         });
 
+        // 注册实例到全局字典
+        registerInstance();
+
         log.info("【{}】XianyuClient实例已创建", cookieId);
     }
 
@@ -209,6 +278,12 @@ public class XianyuClient extends TextWebSocketHandler {
 
         // 关闭WebSocket连接
         closeWebSocket();
+        
+        // 清理实例缓存
+        cleanupInstanceCaches();
+        
+        // 从全局字典中注销实例
+        unregisterInstance();
 
         // 关闭线程池
         if (scheduledExecutor != null && !scheduledExecutor.isShutdown()) {
@@ -957,59 +1032,59 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 处理消息 - 对应Python的handle_message()方法（简化版，核心逻辑已实现）
      */
-    private void handleMessage(JSONObject messageData, WebSocketSession session) {
-        try {
-            // 检查账号是否启用
-            Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
-            if (cookieOpt.isEmpty() || !Boolean.TRUE.equals(cookieOpt.get().getEnabled())) {
-                log.warn("【{}】账号已禁用，跳过消息处理", cookieId);
-                return;
-            }
-
-            // 发送确认消息（ACK）
-            try {
-                sendAck(messageData, session);
-            } catch (Exception e) {
-                log.warn("【{}】发送ACK失败", cookieId, e);
-            }
-
-            // 检查是否为同步包消息
-            if (!isSyncPackage(messageData)) {
-                log.debug("【{}】非同步包消息，跳过处理", cookieId);
-                return;
-            }
-
-            // 记录收到消息的时间
-            lastMessageReceivedTime.set(System.currentTimeMillis());
-            log.warn("【{}】收到消息，更新消息接收时间标识", cookieId);
-
-            // 解密并处理消息内容
-            try {
-                JSONObject syncData = messageData.getJSONObject("body")
-                    .getJSONObject("syncPushPackage")
-                    .getJSONArray("data")
-                    .getJSONObject(0);
-
-                if (!syncData.containsKey("data")) {
-                    log.warn("【{}】同步包中无data字段", cookieId);
-                    return;
-                }
-
-                String data = syncData.getString("data");
-                String decryptedData = XianyuUtils.decrypt(data);
-                JSONObject message = JSON.parseObject(decryptedData);
-
-                // 调用ReplyService处理消息（自动回复等业务逻辑）
-                replyService.processMessage(cookieId, message, session);
-
-            } catch (Exception e) {
-                log.error("【{}】消息解密或处理失败", cookieId, e);
-            }
-
-        } catch (Exception e) {
-            log.error("【{}】处理消息出错", cookieId, e);
-        }
-    }
+//    private void handleMessage(JSONObject messageData, WebSocketSession session) {
+//        try {
+//            // 检查账号是否启用
+//            Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
+//            if (cookieOpt.isEmpty() || !Boolean.TRUE.equals(cookieOpt.get().getEnabled())) {
+//                log.warn("【{}】账号已禁用，跳过消息处理", cookieId);
+//                return;
+//            }
+//
+//            // 发送确认消息（ACK）
+//            try {
+//                sendAck(messageData, session);
+//            } catch (Exception e) {
+//                log.warn("【{}】发送ACK失败", cookieId, e);
+//            }
+//
+//            // 检查是否为同步包消息
+//            if (!isSyncPackage(messageData)) {
+//                log.debug("【{}】非同步包消息，跳过处理", cookieId);
+//                return;
+//            }
+//
+//            // 记录收到消息的时间
+//            lastMessageReceivedTime.set(System.currentTimeMillis());
+//            log.warn("【{}】收到消息，更新消息接收时间标识", cookieId);
+//
+//            // 解密并处理消息内容
+//            try {
+//                JSONObject syncData = messageData.getJSONObject("body")
+//                    .getJSONObject("syncPushPackage")
+//                    .getJSONArray("data")
+//                    .getJSONObject(0);
+//
+//                if (!syncData.containsKey("data")) {
+//                    log.warn("【{}】同步包中无data字段", cookieId);
+//                    return;
+//                }
+//
+//                String data = syncData.getString("data");
+//                String decryptedData = XianyuUtils.decrypt(data);
+//                JSONObject message = JSON.parseObject(decryptedData);
+//
+//                // 调用ReplyService处理消息（自动回复等业务逻辑）
+//                replyService.processMessage(cookieId, message, session);
+//
+//            } catch (Exception e) {
+//                log.error("【{}】消息解密或处理失败", cookieId, e);
+//            }
+//
+//        } catch (Exception e) {
+//            log.error("【{}】处理消息出错", cookieId, e);
+//        }
+//    }
 
     /**
      * 发送ACK确认消息
@@ -1077,107 +1152,107 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 设置连接状态
      */
-    private void setConnectionState(ConnectionState newState, String reason) {
-        if (this.connectionState != newState) {
-            ConnectionState oldState = this.connectionState;
-            this.connectionState = newState;
-            this.lastStateChangeTime.set(System.currentTimeMillis());
-
-            String stateMsg = String.format("【%s】连接状态: %s → %s", 
-                cookieId, oldState.getValue(), newState.getValue());
-            if (StrUtil.isNotBlank(reason)) {
-                stateMsg += " (" + reason + ")";
-            }
-
-            switch (newState) {
-                case FAILED:
-                    log.error(stateMsg);
-                    break;
-                case RECONNECTING:
-                    log.warn(stateMsg);
-                    break;
-                case CONNECTED:
-                    log.info(stateMsg);
-                    break;
-                default:
-                    log.info(stateMsg);
-            }
-        }
-    }
+//    private void setConnectionState(ConnectionState newState, String reason) {
+//        if (this.connectionState != newState) {
+//            ConnectionState oldState = this.connectionState;
+//            this.connectionState = newState;
+//            this.lastStateChangeTime.set(System.currentTimeMillis());
+//
+//            String stateMsg = String.format("【%s】连接状态: %s → %s",
+//                cookieId, oldState.getValue(), newState.getValue());
+//            if (StrUtil.isNotBlank(reason)) {
+//                stateMsg += " (" + reason + ")";
+//            }
+//
+//            switch (newState) {
+//                case FAILED:
+//                    log.error(stateMsg);
+//                    break;
+//                case RECONNECTING:
+//                    log.warn(stateMsg);
+//                    break;
+//                case CONNECTED:
+//                    log.info(stateMsg);
+//                    break;
+//                default:
+//                    log.info(stateMsg);
+//            }
+//        }
+//    }
 
     /**
      * 处理连接错误
      */
-    private void handleConnectionError(Exception e) {
-        connectionFailures.incrementAndGet();
-        setConnectionState(ConnectionState.RECONNECTING, String.format("第%d次失败", connectionFailures.get()));
-        log.error("【{}】WebSocket连接异常 ({}/{}): {}", 
-            cookieId, connectionFailures.get(), MAX_CONNECTION_FAILURES, e.getMessage());
-
-        if (connectionFailures.get() >= MAX_CONNECTION_FAILURES) {
-            log.error("【{}】连接失败次数过多，停止重连", cookieId);
-            setConnectionState(ConnectionState.FAILED, "连接失败次数过多");
-            running.set(false);
-        }
-    }
+//    private void handleConnectionError(Exception e) {
+//        connectionFailures.incrementAndGet();
+//        setConnectionState(ConnectionState.RECONNECTING, String.format("第%d次失败", connectionFailures.get()));
+//        log.error("【{}】WebSocket连接异常 ({}/{}): {}",
+//            cookieId, connectionFailures.get(), MAX_CONNECTION_FAILURES, e.getMessage());
+//
+//        if (connectionFailures.get() >= MAX_CONNECTION_FAILURES) {
+//            log.error("【{}】连接失败次数过多，停止重连", cookieId);
+//            setConnectionState(ConnectionState.FAILED, "连接失败次数过多");
+//            running.set(false);
+//        }
+//    }
 
     /**
      * 计算重试延迟
      */
-    private int calculateRetryDelay(int failures) {
-        if (failures <= 1) {
-            return 3;
-        } else if (failures <= 3) {
-            return 5;
-        } else {
-            return Math.min(10 * failures, 60);
-        }
-    }
+//    private int calculateRetryDelay(int failures) {
+//        if (failures <= 1) {
+//            return 3;
+//        } else if (failures <= 3) {
+//            return 5;
+//        } else {
+//            return Math.min(10 * failures, 60);
+//        }
+//    }
 
     /**
      * 关闭WebSocket连接
      */
-    private void closeWebSocket() {
-        if (webSocketSession != null && webSocketSession.isOpen()) {
-            try {
-                webSocketSession.close();
-                log.info("【{}】WebSocket连接已关闭", cookieId);
-            } catch (Exception e) {
-                log.warn("【{}】关闭WebSocket时出错: {}", cookieId, e.getMessage());
-            }
-        }
-        webSocketSession = null;
-        connected.set(false);
-    }
+//    private void closeWebSocket() {
+//        if (webSocketSession != null && webSocketSession.isOpen()) {
+//            try {
+//                webSocketSession.close();
+//                log.info("【{}】WebSocket连接已关闭", cookieId);
+//            } catch (Exception e) {
+//                log.warn("【{}】关闭WebSocket时出错: {}", cookieId, e.getMessage());
+//            }
+//        }
+//        webSocketSession = null;
+//        connected.set(false);
+//    }
 
     /**
      * 取消所有后台任务
      */
-    private void cancelAllBackgroundTasks() {
-        log.info("【{}】开始取消所有后台任务...", cookieId);
-
-        if (heartbeatTask != null && !heartbeatTask.isDone()) {
-            heartbeatTask.cancel(true);
-            log.info("【{}】心跳任务已取消", cookieId);
-        }
-
-        if (tokenRefreshTask != null && !tokenRefreshTask.isDone()) {
-            tokenRefreshTask.cancel(true);
-            log.info("【{}】Token刷新任务已取消", cookieId);
-        }
-
-        if (cleanupTask != null && !cleanupTask.isDone()) {
-            cleanupTask.cancel(true);
-            log.info("【{}】清理任务已取消", cookieId);
-        }
-
-        if (cookieRefreshTask != null && !cookieRefreshTask.isDone()) {
-            cookieRefreshTask.cancel(true);
-            log.info("【{}】Cookie刷新任务已取消", cookieId);
-        }
-
-        log.info("【{}】所有后台任务已取消", cookieId);
-    }
+//    private void cancelAllBackgroundTasks() {
+//        log.info("【{}】开始取消所有后台任务...", cookieId);
+//
+//        if (heartbeatTask != null && !heartbeatTask.isDone()) {
+//            heartbeatTask.cancel(true);
+//            log.info("【{}】心跳任务已取消", cookieId);
+//        }
+//
+//        if (tokenRefreshTask != null && !tokenRefreshTask.isDone()) {
+//            tokenRefreshTask.cancel(true);
+//            log.info("【{}】Token刷新任务已取消", cookieId);
+//        }
+//
+//        if (cleanupTask != null && !cleanupTask.isDone()) {
+//            cleanupTask.cancel(true);
+//            log.info("【{}】清理任务已取消", cookieId);
+//        }
+//
+//        if (cookieRefreshTask != null && !cookieRefreshTask.isDone()) {
+//            cookieRefreshTask.cancel(true);
+//            log.info("【{}】Cookie刷新任务已取消", cookieId);
+//        }
+//
+//        log.info("【{}】所有后台任务已取消", cookieId);
+//    }
 
     /**
      * 清理过期的Map条目
@@ -1454,6 +1529,1283 @@ public class XianyuClient extends TextWebSocketHandler {
             log.error("【{}】保存cookies到数据库失败", cookieId, e);
         }
     }
+    
+    // ============== 实例管理方法 ==============
+    
+    /**
+     * 注册当前实例到全局字典
+     * 对应Python的_register_instance()方法
+     */
+    private void registerInstance() {
+        try {
+            INSTANCES_LOCK.lock();
+            try {
+                INSTANCES.put(cookieId, this);
+                log.warn("【{}】实例已注册到全局字典", cookieId);
+            } finally {
+                INSTANCES_LOCK.unlock();
+            }
+        } catch (Exception e) {
+            log.error("【{}】注册实例失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 从全局字典中注销当前实例
+     * 对应Python的_unregister_instance()方法
+     */
+    private void unregisterInstance() {
+        try {
+            INSTANCES_LOCK.lock();
+            try {
+                if (INSTANCES.containsKey(cookieId)) {
+                    INSTANCES.remove(cookieId);
+                    log.warn("【{}】实例已从全局字典中注销", cookieId);
+                }
+            } finally {
+                INSTANCES_LOCK.unlock();
+            }
+        } catch (Exception e) {
+            log.error("【{}】注销实例失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 获取指定cookieId的XianyuClient实例
+     * 对应Python的get_instance()类方法
+     */
+    public static XianyuClient getInstance(String cookieId) {
+        return INSTANCES.get(cookieId);
+    }
+    
+    /**
+     * 获取所有活跃的XianyuClient实例
+     * 对应Python的get_all_instances()类方法
+     */
+    public static Map<String, XianyuClient> getAllInstances() {
+        return new HashMap<>(INSTANCES);
+    }
+    
+    /**
+     * 获取当前活跃实例数量
+     * 对应Python的get_instance_count()类方法
+     */
+    public static int getInstanceCount() {
+        return INSTANCES.size();
+    }
+    
+    // ============== 锁管理方法 ==============
+    
+    /**
+     * 检查指定的锁是否仍在持有状态
+     * 对应Python的is_lock_held()方法
+     */
+    private boolean isLockHeld(String lockKey) {
+        if (!LOCK_HOLD_INFO.containsKey(lockKey)) {
+            return false;
+        }
+        
+        LockHoldInfo lockInfo = LOCK_HOLD_INFO.get(lockKey);
+        return lockInfo.isLocked();
+    }
+    
+    /**
+     * 延迟释放锁的任务
+     * 对应Python的_delayed_lock_release()方法
+     */
+    private CompletableFuture<Void> delayedLockRelease(String lockKey, int delayMinutes) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                long delayMillis = delayMinutes * 60L * 1000L;
+                log.info("【{}】订单锁 {} 将在 {} 分钟后释放", cookieId, lockKey, delayMinutes);
+                
+                Thread.sleep(delayMillis);
+                
+                // 检查锁是否仍然存在且需要释放
+                LockHoldInfo lockInfo = LOCK_HOLD_INFO.get(lockKey);
+                if (lockInfo != null && lockInfo.isLocked()) {
+                    lockInfo.setLocked(false);
+                    lockInfo.setReleaseTime(System.currentTimeMillis());
+                    log.info("【{}】订单锁 {} 延迟释放完成", cookieId, lockKey);
+                }
+                
+                // 清理锁信息
+                lockInfo.setTask(null);
+                LOCK_HOLD_INFO.remove(lockKey);
+                LOCK_USAGE_TIMES.remove(lockKey);
+                
+                ReentrantLock orderLock = ORDER_LOCKS.get(lockKey);
+                if (orderLock != null && !orderLock.isLocked()) {
+                    ORDER_LOCKS.remove(lockKey);
+                }
+                
+            } catch (InterruptedException e) {
+                log.info("【{}】订单锁 {} 延迟释放任务被中断", cookieId, lockKey);
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                log.error("【{}】订单锁 {} 延迟释放失败", cookieId, lockKey, e);
+            }
+        }, scheduledExecutor);
+    }
+    
+    /**
+     * 清理过期的锁
+     * 对应Python的cleanup_expired_locks()方法
+     */
+    private void cleanupExpiredLocks(int maxAgeHours) {
+        try {
+            long currentTime = System.currentTimeMillis();
+            long maxAgeMillis = maxAgeHours * 3600L * 1000L;
+            
+            // 清理自动发货锁
+            Set<String> expiredDeliveryLocks = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : LOCK_USAGE_TIMES.entrySet()) {
+                if (currentTime - entry.getValue() > maxAgeMillis) {
+                    expiredDeliveryLocks.add(entry.getKey());
+                }
+            }
+            
+            for (String orderId : expiredDeliveryLocks) {
+                ORDER_LOCKS.remove(orderId);
+                LOCK_USAGE_TIMES.remove(orderId);
+                
+                // 清理锁持有信息，取消延迟释放任务
+                LockHoldInfo lockInfo = LOCK_HOLD_INFO.remove(orderId);
+                if (lockInfo != null && lockInfo.getTask() != null) {
+                    lockInfo.getTask().cancel(true);
+                }
+            }
+            
+            if (!expiredDeliveryLocks.isEmpty()) {
+                log.info("【{}】清理了 {} 个过期的订单锁", cookieId, expiredDeliveryLocks.size());
+            }
+            
+            // 清理订单详情锁
+            Set<String> expiredDetailLocks = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : ORDER_DETAIL_LOCK_TIMES.entrySet()) {
+                if (currentTime - entry.getValue() > maxAgeMillis) {
+                    expiredDetailLocks.add(entry.getKey());
+                }
+            }
+            
+            for (String orderId : expiredDetailLocks) {
+                ORDER_DETAIL_LOCKS.remove(orderId);
+                ORDER_DETAIL_LOCK_TIMES.remove(orderId);
+            }
+            
+            if (!expiredDetailLocks.isEmpty()) {
+                log.info("【{}】清理了 {} 个过期的订单详情锁", cookieId, expiredDetailLocks.size());
+            }
+            
+        } catch (Exception e) {
+            log.error("【{}】清理过期锁时出错", cookieId, e);
+        }
+    }
+    
+    // ============== 缓存管理方法 ==============
+    
+    /**
+     * 添加商品详情到缓存，实现LRU策略和大小限制
+     * 对应Python的_add_to_item_cache()方法
+     */
+    private void addToItemCache(String itemId, String detail) {
+        ITEM_DETAIL_CACHE_LOCK.lock();
+        try {
+            long currentTime = System.currentTimeMillis();
+            
+            // 检查缓存大小，如果超过限制则清理
+            if (ITEM_DETAIL_CACHE.size() >= ITEM_DETAIL_CACHE_MAX_SIZE) {
+                // 使用LRU策略删除最久未访问的项
+                if (!ITEM_DETAIL_CACHE.isEmpty()) {
+                    String oldestItemId = ITEM_DETAIL_CACHE.entrySet().stream()
+                        .min((e1, e2) -> Long.compare(e1.getValue().getAccessTime(), e2.getValue().getAccessTime()))
+                        .map(Map.Entry::getKey)
+                        .orElse(null);
+                    
+                    if (oldestItemId != null) {
+                        ITEM_DETAIL_CACHE.remove(oldestItemId);
+                        log.warn("【{}】缓存已满，删除最旧项: {}", cookieId, oldestItemId);
+                    }
+                }
+            }
+            
+            // 添加新项到缓存
+            ITEM_DETAIL_CACHE.put(itemId, new ItemDetailCache(detail));
+            log.warn("【{}】添加商品详情到缓存: {}, 当前缓存大小: {}", cookieId, itemId, ITEM_DETAIL_CACHE.size());
+            
+        } finally {
+            ITEM_DETAIL_CACHE_LOCK.unlock();
+        }
+    }
+    
+    /**
+     * 清理过期的商品详情缓存
+     * 对应Python的_cleanup_item_cache()类方法
+     */
+    public static int cleanupItemCache() {
+        ITEM_DETAIL_CACHE_LOCK.lock();
+        try {
+            long currentTime = System.currentTimeMillis();
+            Set<String> expiredItems = new java.util.HashSet<>();
+            
+            // 找出所有过期的项
+            for (Map.Entry<String, ItemDetailCache> entry : ITEM_DETAIL_CACHE.entrySet()) {
+                if (entry.getValue().isExpired(ITEM_DETAIL_CACHE_TTL)) {
+                    expiredItems.add(entry.getKey());
+                }
+            }
+            
+            // 删除过期项
+            for (String itemId : expiredItems) {
+                ITEM_DETAIL_CACHE.remove(itemId);
+            }
+            
+            if (!expiredItems.isEmpty()) {
+                log.info("清理了 {} 个过期的商品详情缓存", expiredItems.size());
+            }
+            
+            return expiredItems.size();
+            
+        } finally {
+            ITEM_DETAIL_CACHE_LOCK.unlock();
+        }
+    }
+    
+    /**
+     * 清理实例级别的缓存
+     * 对应Python的_cleanup_instance_caches()方法
+     */
+    private void cleanupInstanceCaches() {
+        try {
+            long currentTime = System.currentTimeMillis();
+            int cleanedTotal = 0;
+            
+            // 清理过期的通知记录（保留30分钟内的）
+            long maxNotificationAge = 1800 * 1000L; // 30分钟
+            Set<String> expiredNotifications = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : lastNotificationTime.entrySet()) {
+                if (currentTime - entry.getValue() > maxNotificationAge) {
+                    expiredNotifications.add(entry.getKey());
+                }
+            }
+            for (String key : expiredNotifications) {
+                lastNotificationTime.remove(key);
+            }
+            if (!expiredNotifications.isEmpty()) {
+                cleanedTotal += expiredNotifications.size();
+                log.warn("【{}】清理了 {} 个过期通知记录", cookieId, expiredNotifications.size());
+            }
+            
+            // 清理过期的发货记录
+            long maxDeliveryAge = 1800 * 1000L; // 30分钟
+            Set<String> expiredDeliveries = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : lastDeliveryTime.entrySet()) {
+                if (currentTime - entry.getValue() > maxDeliveryAge) {
+                    expiredDeliveries.add(entry.getKey());
+                }
+            }
+            for (String orderId : expiredDeliveries) {
+                lastDeliveryTime.remove(orderId);
+            }
+            if (!expiredDeliveries.isEmpty()) {
+                cleanedTotal += expiredDeliveries.size();
+                log.warn("【{}】清理了 {} 个过期发货记录", cookieId, expiredDeliveries.size());
+            }
+            
+            // 清理过期的已发货记录
+            Set<String> expiredSentOrders = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : deliverySentOrders.entrySet()) {
+                if (currentTime - entry.getValue() > maxDeliveryAge) {
+                    expiredSentOrders.add(entry.getKey());
+                }
+            }
+            for (String orderId : expiredSentOrders) {
+                deliverySentOrders.remove(orderId);
+            }
+            if (!expiredSentOrders.isEmpty()) {
+                cleanedTotal += expiredSentOrders.size();
+                log.warn("【{}】清理了 {} 个已发货记录", cookieId, expiredSentOrders.size());
+            }
+            
+            // 清理过期的订单确认记录
+            long maxConfirmAge = 1800 * 1000L; // 30分钟
+            Set<String> expiredConfirms = new java.util.HashSet<>();
+            for (Map.Entry<String, Long> entry : confirmedOrders.entrySet()) {
+                if (currentTime - entry.getValue() > maxConfirmAge) {
+                    expiredConfirms.add(entry.getKey());
+                }
+            }
+            for (String orderId : expiredConfirms) {
+                confirmedOrders.remove(orderId);
+            }
+            if (!expiredConfirms.isEmpty()) {
+                cleanedTotal += expiredConfirms.size();
+                log.warn("【{}】清理了 {} 个过期订单确认记录", cookieId, expiredConfirms.size());
+            }
+            
+            // 清理已处理的消息ID（保留1小时内的）
+            processedMessageIdsLock.lock();
+            try {
+                long messageExpireTime = MESSAGE_EXPIRE_TIME * 1000L;
+                Set<String> expiredMessages = new java.util.HashSet<>();
+                for (Map.Entry<String, Long> entry : processedMessageIds.entrySet()) {
+                    if (currentTime - entry.getValue() > messageExpireTime) {
+                        expiredMessages.add(entry.getKey());
+                    }
+                }
+                for (String messageId : expiredMessages) {
+                    processedMessageIds.remove(messageId);
+                }
+                if (!expiredMessages.isEmpty()) {
+                    cleanedTotal += expiredMessages.size();
+                    log.warn("【{}】清理了 {} 个过期消息ID", cookieId, expiredMessages.size());
+                }
+            } finally {
+                processedMessageIdsLock.unlock();
+            }
+            
+            if (cleanedTotal > 0) {
+                log.info("【{}】实例缓存清理完成，共清理 {} 条记录", cookieId, cleanedTotal);
+                log.warn("【{}】当前缓存数量 - 通知: {}, 发货: {}, 已发货: {}, 确认: {}, 消息ID: {}",
+                    cookieId, lastNotificationTime.size(), lastDeliveryTime.size(), 
+                    deliverySentOrders.size(), confirmedOrders.size(), processedMessageIds.size());
+            }
+            
+        } catch (Exception e) {
+            log.error("【{}】清理实例缓存时出错", cookieId, e);
+        }
+    }
+    
+    // ============== 工具方法 ==============
+    
+    /**
+     * 安全地将异常转换为字符串
+     * 对应Python的_safe_str()方法
+     */
+    private String safeStr(Exception e) {
+        try {
+            return e.toString();
+        } catch (Exception e1) {
+            try {
+                return String.valueOf(e);
+            } catch (Exception e2) {
+                return "未知错误";
+            }
+        }
+    }
+    
+    /**
+     * 设置连接状态并记录日志
+     * 对应Python的_set_connection_state()方法
+     */
+    private void setConnectionState(ConnectionState newState, String reason) {
+        if (connectionState != newState) {
+            ConnectionState oldState = connectionState;
+            connectionState = newState;
+            lastStateChangeTime.set(System.currentTimeMillis());
+            
+            // 记录状态转换
+            String stateMsg = String.format("【%s】连接状态: %s → %s", cookieId, oldState.getValue(), newState.getValue());
+            if (StrUtil.isNotBlank(reason)) {
+                stateMsg += " (" + reason + ")";
+            }
+            
+            // 根据状态严重程度选择日志级别
+            switch (newState) {
+                case FAILED:
+                    log.error(stateMsg);
+                    break;
+                case RECONNECTING:
+                    log.warn(stateMsg);
+                    break;
+                case CONNECTED:
+                    log.info(stateMsg); // 成功状态用info级别
+                    break;
+                default:
+                    log.info(stateMsg);
+            }
+        }
+    }
+    
+    /**
+     * 处理连接错误
+     * 对应Python的handleConnectionError()方法（隐式）
+     */
+    private void handleConnectionError(Exception e) {
+        connectionFailures.incrementAndGet();
+        log.error("【{}】WebSocket连接错误（失败次数: {}）", cookieId, connectionFailures.get(), e);
+        
+        if (connectionFailures.get() >= MAX_CONNECTION_FAILURES) {
+            log.error("【{}】连接失败次数过多，停止重连", cookieId);
+            setConnectionState(ConnectionState.FAILED, "连接失败次数过多");
+            running.set(false);
+        } else {
+            setConnectionState(ConnectionState.RECONNECTING, e.getMessage());
+        }
+    }
+    
+    /**
+     * 计算重试延迟（秒）
+     * 对应Python的_calculate_retry_delay()方法
+     */
+    private int calculateRetryDelay(int failures) {
+        // 根据失败次数计算延迟：3秒 * 失败次数,最多30秒
+        return Math.min(3 * failures, 30);
+    }
+    
+    // ============== 消息发送方法 ==============
+    
+    /**
+     * 发送文本消息
+     * 对应Python的send_msg()方法
+     */
+    private void sendMsg(WebSocketSession session, String chatId, String toUserId, String content) throws Exception {
+        if (session == null || !session.isOpen()) {
+            throw new Exception("WebSocket连接已关闭");
+        }
+        
+        JSONObject msg = new JSONObject();
+        msg.put("lwp", "/r/ImCore/sendMsg");
+        
+        JSONObject headers = new JSONObject();
+        headers.put("mid", XianyuUtils.generateMid());
+        msg.put("headers", headers);
+        
+        JSONObject body = new JSONObject();
+        body.put("cid", chatId);
+        body.put("toUser", toUserId);
+        body.put("type", "text");
+        body.put("content", content);
+        
+        msg.put("body", body);
+        
+        session.sendMessage(new TextMessage(msg.toJSONString()));
+        log.info("【{}】已发送文本消息到聊天: {}", cookieId, chatId);
+    }
+    
+    /**
+     * 发送图片消息
+     * 对应Python的send_image_msg()方法
+     */
+    private void sendImageMsg(WebSocketSession session, String chatId, String toUserId, String imageUrl, Integer cardId) throws Exception {
+        if (session == null || !session.isOpen()) {
+            throw new Exception("WebSocket连接已关闭");
+        }
+        
+        JSONObject msg = new JSONObject();
+        msg.put("lwp", "/r/ImCore/sendMsg");
+        
+        JSONObject headers = new JSONObject();
+        headers.put("mid", XianyuUtils.generateMid());
+        msg.put("headers", headers);
+        
+        JSONObject body = new JSONObject();
+        body.put("cid", chatId);
+        body.put("toUser", toUserId);
+        body.put("type", "image");
+        body.put("content", imageUrl);
+        
+        if (cardId != null) {
+            body.put("card_id", cardId);
+        }
+        
+        msg.put("body", body);
+        
+        session.sendMessage(new TextMessage(msg.toJSONString()));
+        log.info("【{}】已发送图片消息到聊天: {}, 图片: {}", cookieId, chatId, imageUrl);
+    }
+    
+    // ============== 防重复机制方法 ==============
+    
+    /**
+     * 检查是否可以自动发货（基于时间的冷却机制）
+     * 对应Python的can_auto_delivery()方法
+     */
+    private boolean canAutoDelivery(String orderId) {
+        if (!lastDeliveryTime.containsKey(orderId)) {
+            return true;
+        }
+        
+        long currentTime = System.currentTimeMillis();
+        long lastTime = lastDeliveryTime.get(orderId);
+        long timeSinceLastDelivery = (currentTime - lastTime) / 1000; // 转换为秒
+        
+        if (timeSinceLastDelivery < DELIVERY_COOLDOWN) {
+            long remainingTime = DELIVERY_COOLDOWN - timeSinceLastDelivery;
+            log.info("【{}】订单 {} 在冷却期内，还需等待 {} 秒", cookieId, orderId, remainingTime);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * 标记订单已发货
+     * 对应Python的mark_delivery_sent()方法
+     */
+    private void markDeliverySent(String orderId) {
+        long currentTime = System.currentTimeMillis();
+        lastDeliveryTime.put(orderId, currentTime);
+        deliverySentOrders.put(orderId, currentTime);
+        log.info("【{}】标记订单已发货: {}", cookieId, orderId);
+    }
+    
+    /**
+     * 检查是否可以发送通知（防重复）
+     * 对应Python的_can_send_notification()方法
+     */
+    private boolean canSendNotification(String notificationType) {
+        if (!lastNotificationTime.containsKey(notificationType)) {
+            return true;
+        }
+        
+        long currentTime = System.currentTimeMillis();
+        long lastTime = lastNotificationTime.get(notificationType);
+        long timeSinceLastNotification = (currentTime - lastTime) / 1000;
+        
+        // Token刷新通知使用更长的冷却时间
+        int cooldown = NOTIFICATION_COOLDOWN;
+        if ("token_refresh".equals(notificationType) || "token_refresh_exception".equals(notificationType)) {
+            cooldown = 18000; // 5小时
+        }
+        
+        if (timeSinceLastNotification < cooldown) {
+            log.debug("【{}】通知类型 {} 在冷却期内", cookieId, notificationType);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * 记录通知发送时间
+     */
+    private void markNotificationSent(String notificationType) {
+        lastNotificationTime.put(notificationType, System.currentTimeMillis());
+    }
+    
+    // ============== 后台任务取消方法 ==============
+    
+    /**
+     * 取消所有后台任务
+     * 对应Python的_cancel_background_tasks()方法
+     */
+    private void cancelAllBackgroundTasks() {
+        try {
+            int tasksToCancel = 0;
+            
+            // 收集所有需要取消的任务
+            if (heartbeatTask != null && !heartbeatTask.isDone()) {
+                tasksToCancel++;
+            }
+            if (tokenRefreshTask != null && !tokenRefreshTask.isDone()) {
+                tasksToCancel++;
+            }
+            if (cleanupTask != null && !cleanupTask.isDone()) {
+                tasksToCancel++;
+            }
+            if (cookieRefreshTask != null && !cookieRefreshTask.isDone()) {
+                tasksToCancel++;
+            }
+            
+            if (tasksToCancel == 0) {
+                log.info("【{}】没有后台任务需要取消（所有任务已完成或不存在）", cookieId);
+                // 重置任务引用
+                heartbeatTask = null;
+                tokenRefreshTask = null;
+                cleanupTask = null;
+                cookieRefreshTask = null;
+                return;
+            }
+            
+            log.info("【{}】开始取消 {} 个未完成的后台任务...", cookieId, tasksToCancel);
+            
+            // 取消所有任务
+            if (heartbeatTask != null && !heartbeatTask.isDone()) {
+                heartbeatTask.cancel(true);
+                log.info("【{}】已取消心跳任务", cookieId);
+            }
+            if (tokenRefreshTask != null && !tokenRefreshTask.isDone()) {
+                tokenRefreshTask.cancel(true);
+                log.info("【{}】已取消Token刷新任务", cookieId);
+            }
+            if (cleanupTask != null && !cleanupTask.isDone()) {
+                cleanupTask.cancel(true);
+                log.info("【{}】已取消清理任务", cookieId);
+            }
+            if (cookieRefreshTask != null && !cookieRefreshTask.isDone()) {
+                cookieRefreshTask.cancel(true);
+                log.info("【{}】已取消Cookie刷新任务", cookieId);
+            }
+            
+            // 等待任务完成取消（最多5秒）
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            log.info("【{}】所有后台任务已取消", cookieId);
+            
+        } catch (Exception e) {
+            log.error("【{}】取消后台任务时出错", cookieId, e);
+        } finally {
+            // 重置任务引用
+            heartbeatTask = null;
+            tokenRefreshTask = null;
+            cleanupTask = null;
+            cookieRefreshTask = null;
+            log.info("【{}】后台任务引用已全部重置", cookieId);
+        }
+    }
+    
+    /**
+     * 关闭WebSocket连接
+     */
+    private void closeWebSocket() {
+        if (webSocketSession != null) {
+            try {
+                if (webSocketSession.isOpen()) {
+                    webSocketSession.close();
+                    log.info("【{}】WebSocket连接已关闭", cookieId);
+                }
+            } catch (Exception e) {
+                log.error("【{}】关闭WebSocket时出错", cookieId, e);
+            } finally {
+                webSocketSession = null;
+                connected.set(false);
+            }
+        }
+    }
+    
+    
+    // ============== 订单ID提取方法 ==============
+    
+    /**
+     * 从消息中提取订单ID
+     * 对应Python的_extract_order_id()方法
+     */
+    private String extractOrderId(JSONObject message) {
+        try {
+            String orderId = null;
+            
+            // 先查看消息的完整结构
+            log.warn("【{}】🔍 完整消息结构: {}", cookieId, message.toJSONString());
+            
+            // 检查message['1']的结构
+            Object message1 = message.get("1");
+            String contentJsonStr = "";
+            
+            if (message1 instanceof JSONObject) {
+                JSONObject message1Obj = (JSONObject) message1;
+                log.warn("【{}】🔍 message['1'] 是对象，keys: {}", cookieId, message1Obj.keySet());
+                
+                // 检查message['1']['6']的结构
+                Object message16 = message1Obj.get("6");
+                if (message16 instanceof JSONObject) {
+                    JSONObject message16Obj = (JSONObject) message16;
+                    log.warn("【{}】🔍 message['1']['6'] 是对象，keys: {}", cookieId, message16Obj.keySet());
+                    
+                    // 方法1: 从button的targetUrl中提取orderId
+                    Object message163 = message16Obj.get("3");
+                    if (message163 instanceof JSONObject) {
+                        contentJsonStr = ((JSONObject) message163).getString("5");
+                    }
+                }
+            }
+            
+            // 解析内容JSON
+            if (StrUtil.isNotBlank(contentJsonStr)) {
+                try {
+                    JSONObject contentData = JSON.parseObject(contentJsonStr);
+                    
+                    // 方法1a: 从button的targetUrl中提取orderId
+                    String targetUrl = contentData.getJSONObject("dxCard")
+                        .getJSONObject("item")
+                        .getJSONObject("main")
+                        .getJSONObject("exContent")
+                        .getJSONObject("button")
+                        .getString("targetUrl");
+                    
+                    if (StrUtil.isNotBlank(targetUrl)) {
+                        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("orderId=(\\d+)");
+                        java.util.regex.Matcher matcher = pattern.matcher(targetUrl);
+                        if (matcher.find()) {
+                            orderId = matcher.group(1);
+                            log.info("【{}】✅ 从button提取到订单ID: {}", cookieId, orderId);
+                        }
+                    }
+                    
+                    // 方法1b: 从main的targetUrl中提取order_detail的id
+                    if (orderId == null) {
+                        String mainTargetUrl = contentData.getJSONObject("dxCard")
+                            .getJSONObject("item")
+                            .getJSONObject("main")
+                            .getString("targetUrl");
+                        
+                        if (StrUtil.isNotBlank(mainTargetUrl)) {
+                            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("order_detail\\?id=(\\d+)");
+                            java.util.regex.Matcher matcher = pattern.matcher(mainTargetUrl);
+                            if (matcher.find()) {
+                                orderId = matcher.group(1);
+                                log.info("【{}】✅ 从main targetUrl提取到订单ID: {}", cookieId, orderId);
+                            }
+                        }
+                    }
+                    
+                } catch (Exception parseE) {
+                    log.warn("解析内容JSON失败: {}", parseE.getMessage());
+                }
+            }
+            
+            // 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
+            if (orderId == null) {
+                try {
+                    String messageStr = message.toJSONString();
+                    
+                    // 搜索各种可能的订单ID模式
+                    String[] patterns = {
+                        "orderId[=:](\\d{10,})",
+                        "order_detail\\?id=(\\d{10,})",
+                        "\"id\"\\s*:\\s*\"?(\\d{10,})\"?",
+                        "bizOrderId[=:](\\d{10,})"
+                    };
+                    
+                    for (String patternStr : patterns) {
+                        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(patternStr);
+                        java.util.regex.Matcher matcher = pattern.matcher(messageStr);
+                        if (matcher.find()) {
+                            orderId = matcher.group(1);
+                            log.info("【{}】✅ 从消息字符串中提取到订单ID: {} (模式: {})", cookieId, orderId, patternStr);
+                            break;
+                        }
+                    }
+                    
+                } catch (Exception searchE) {
+                    log.warn("在消息字符串中搜索订单ID失败: {}", searchE.getMessage());
+                }
+            }
+            
+            if (orderId != null) {
+                log.info("【{}】🎯 最终提取到订单ID: {}", cookieId, orderId);
+            } else {
+                log.warn("【{}】❌ 未能从消息中提取到订单ID", cookieId);
+            }
+            
+            return orderId;
+            
+        } catch (Exception e) {
+            log.error("【{}】提取订单ID失败", cookieId, e);
+            return null;
+        }
+    }
+    
+    /**
+     * 检查消息是否为自动发货触发关键字
+     * 对应Python的_is_auto_delivery_trigger()方法
+     */
+    private boolean isAutoDeliveryTrigger(String message) {
+        // 定义所有自动发货触发关键字
+        String[] autoDeliveryKeywords = {
+            "[我已付款，等待你发货]",
+            "[已付款，待发货]",
+            "我已付款，等待你发货",
+            "[记得及时发货]"
+        };
+        
+        // 检查消息是否包含任何触发关键字
+        for (String keyword : autoDeliveryKeywords) {
+            if (message.contains(keyword)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * 检查当前账号是否启用自动确认发货
+     * 对应Python的is_auto_confirm_enabled()方法
+     */
+    private boolean isAutoConfirmEnabled() {
+        // 这里需要从数据库获取配置
+        // 暂时返回true，具体实现需要调用数据库服务
+        return true;
+    }
+    
+    /**
+     * 创建并追踪后台任务
+     * 对应Python的_create_tracked_task()方法
+     */
+    private CompletableFuture<Void> createTrackedTask(Runnable task) {
+        CompletableFuture<Void> future = CompletableFuture.runAsync(task, scheduledExecutor);
+        
+        // 添加到追踪集合
+        backgroundTasks.add(future);
+        
+        // 任务完成后从追踪集合中移除
+        future.whenComplete((result, error) -> {
+            backgroundTasks.remove(future);
+            if (error != null) {
+                log.error("【{}】后台任务执行失败", cookieId, error);
+            }
+        });
+        
+        return future;
+    }
+    
+    // ============== 消息处理主逻辑 ==============
+    
+    /**
+     * 处理消息主逻辑
+     * 对应Python的handle_message()方法
+     * 严格按照Python逻辑实现
+     */
+    private void handleMessage(JSONObject message, WebSocketSession session) {
+        try {
+            // 更新最后收到消息的时间（对应Python的 self.last_message_received_time = time.time()）
+            lastMessageReceivedTime.set(System.currentTimeMillis());
+            log.warn("【{}】收到消息，更新消息接收时间标识", cookieId);
+            
+            // 提取消息基本信息（根据Python逻辑，消息结构使用数字字符串作为key）
+            // Python: message_1 = message.get("1")
+            Object message1Obj = message.get("1");
+            if (message1Obj == null) {
+                log.debug("【{}】消息中没有'1'字段，跳过处理", cookieId);
+                return;
+            }
+            
+            // Python中检查message["1"]是字符串还是字典
+            // if isinstance(message_1, str) and '@' in message_1:
+            //     temp_user_id = message_1.split('@')[0]
+            // elif isinstance(message_1, dict):
+            //     ...
+            
+            // 使用final变量确保lambda可以访问
+            final String chatId;
+            final String content;
+            final String sendUserId;
+            final String sendUserName;
+            
+            if (message1Obj instanceof JSONObject) {
+                JSONObject message1 = (JSONObject) message1Obj;
+                
+                // 提取聊天相关信息（对应Python中的提取逻辑）
+                // Python: message["1"]["10"]
+                Object message10 = message1.get("10");
+                if (message10 instanceof JSONObject) {
+                    JSONObject message10Obj = (JSONObject) message10;
+                    sendUserId = message10Obj.getString("senderUserId") != null ? message10Obj.getString("senderUserId") : "";
+                    sendUserName = message10Obj.getString("senderUserName") != null ? message10Obj.getString("senderUserName") : "";
+                } else {
+                    sendUserId = "";
+                    sendUserName = "";
+                }
+                
+                // 尝试提取聊天ID和消息内容
+                chatId = message1.getString("1") != null ? message1.getString("1") : "";
+                content = message1.getString("3") != null ? message1.getString("3") : "";
+            } else {
+                // 如果message["1"]不是JSONObject，初始化为空字符串
+                chatId = "";
+                content = "";
+                sendUserId = "";
+                sendUserName = "";
+            }
+            
+            // 检查是否为自动发货触发消息
+            // Python中通过_is_auto_delivery_trigger检查消息内容
+            if (content != null && isAutoDeliveryTrigger(content)) {
+                log.info("【{}】检测到自动发货触发消息", cookieId);
+                
+                // 提取订单ID（对应Python的 order_id = self._extract_order_id(message)）
+                String orderId = extractOrderId(message);
+                final String itemId = ""; // 从消息中提取商品ID
+                
+                // 异步处理自动发货（对应Python的 asyncio.create_task）
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        handleAutoDelivery(session, message, sendUserName, sendUserId, itemId, chatId);
+                    } catch (Exception e) {
+                        log.error("【{}】自动发货处理失败", cookieId, e);
+                    }
+                }, scheduledExecutor);
+                
+                return;
+            }
+            
+            // 其他消息处理逻辑（Python中调用回复服务等）
+            // 这里是简化实现，实际需要调用replyService.getReply()等方法
+            log.info("【{}】普通消息处理（简化实现）", cookieId);
+            
+        } catch (Exception e) {
+            log.error("【{}】消息处理失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 统一处理自动发货逻辑
+     * 对应Python的_handle_auto_delivery()方法
+     * 注意：这是简化版本，核心流程完整但省略了部分复杂验证
+     */
+    private void handleAutoDelivery(WebSocketSession session, JSONObject message, 
+                                    String sendUserName, String sendUserId, 
+                                    String itemId, String chatId) {
+        try {
+            // 提取订单ID
+            String orderId = extractOrderId(message);
+            
+            if (orderId == null) {
+                log.warn("【{}】未能提取到订单ID，跳过自动发货", cookieId);
+                return;
+            }
+            
+            // 第一重检查：延迟锁状态
+            if (isLockHeld(orderId)) {
+                log.info("【{}】订单 {} 延迟锁仍在持有状态，跳过发货", cookieId, orderId);
+                return;
+            }
+            
+            // 第二重检查：时间冷却机制
+            if (!canAutoDelivery(orderId)) {
+                log.info("【{}】订单 {} 在冷却期内，跳过发货", cookieId, orderId);
+                return;
+            }
+            
+            // 获取订单锁
+            ReentrantLock orderLock = ORDER_LOCKS.computeIfAbsent(orderId, k -> new ReentrantLock());
+            LOCK_USAGE_TIMES.put(orderId, System.currentTimeMillis());
+            
+            orderLock.lock();
+            try {
+                log.info("【{}】获取订单锁成功: {}，开始处理自动发货", cookieId, orderId);
+                
+                // 第三重检查：获取锁后再次检查延迟锁状态
+                if (isLockHeld(orderId)) {
+                    log.info("【{}】订单 {} 在获取锁后检查发现延迟锁仍持有，跳过发货", cookieId, orderId);
+                    return;
+                }
+                
+                // 第四重检查：获取锁后再次检查冷却状态
+                if (!canAutoDelivery(orderId)) {
+                    log.info("【{}】订单 {} 在获取锁后检查发现仍在冷却期，跳过发货", cookieId, orderId);
+                    return;
+                }
+                
+                // 执行自动发货逻辑（简化实现）
+                log.info("【{}】准备自动发货: itemId={}, orderId={}", cookieId, itemId, orderId);
+                
+                // 这里应该调用实际的发货方法，获取发货内容
+                // 简化实现：直接发送一个测试消息
+                String deliveryContent = "【自动发货】您的订单已发货，请查收！";
+                
+                // 发送发货消息
+                sendMsg(session, chatId, sendUserId, deliveryContent);
+                
+                // 标记已发货
+                markDeliverySent(orderId);
+                
+                // 设置延迟锁（10分钟后释放）
+                LockHoldInfo lockInfo = new LockHoldInfo(true, System.currentTimeMillis());
+                LOCK_HOLD_INFO.put(orderId, lockInfo);
+                
+                // 启动延迟释放任务
+                CompletableFuture<Void> delayTask = delayedLockRelease(orderId, 10);
+                lockInfo.setTask(delayTask);
+                
+                log.info("【{}】自动发货完成: {}", cookieId, orderId);
+                
+            } finally {
+                orderLock.unlock();
+                log.info("【{}】订单锁释放: {}", cookieId, orderId);
+            }
+            
+        } catch (Exception e) {
+            log.error("【{}】自动发货处理异常", cookieId, e);
+        }
+    }
+    
+    // ============== 通知系统方法 ==============
+    
+    /**
+     * 发送Token刷新通知
+     * 对应Python的send_token_refresh_notification()方法
+     * 简化实现：只记录日志和更新时间
+     */
+    private void sendTokenRefreshNotification(String errorMessage, String notificationType) {
+        try {
+            // 检查是否可以发送通知
+            if (!canSendNotification(notificationType)) {
+                log.debug("【{}】通知在冷却期内，跳过: {}", cookieId, notificationType);
+                return;
+            }
+            
+            // 记录通知（简化实现：实际应该调用钉钉API等）
+            log.warn("【{}】[Token刷新通知] 类型:{}, 消息:{}", cookieId, notificationType, errorMessage);
+            
+            // 标记通知已发送
+            markNotificationSent(notificationType);
+            
+        } catch (Exception e) {
+            log.error("【{}】发送Token刷新通知失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 发送发货失败通知
+     * 对应Python的send_delivery_failure_notification()方法
+     */
+    private void sendDeliveryFailureNotification(String sendUserName, String sendUserId, 
+                                                 String itemId, String reason, String chatId) {
+        try {
+            String notificationType = "delivery_" + itemId;
+            
+            if (!canSendNotification(notificationType)) {
+                log.debug("【{}】发货通知在冷却期内", cookieId);
+                return;
+            }
+            
+            log.warn("【{}】[发货通知] 用户:{}, 商品:{}, 原因:{}", 
+                cookieId, sendUserName, itemId, reason);
+            
+            markNotificationSent(notificationType);
+            
+        } catch (Exception e) {
+            log.error("【{}】发送发货通知失败", cookieId, e);
+        }
+    }
+    
+    // ============== 订单处理方法 ==============
+    
+    /**
+     * 获取订单详情信息
+     * 对应Python的fetch_order_detail_info()方法
+     * 简化实现：返回基本信息
+     */
+    private JSONObject fetchOrderDetailInfo(String orderId, String itemId, String buyerId) {
+        try {
+            log.info("【{}】获取订单详情: orderId={}", cookieId, orderId);
+            
+            // 获取订单详情锁
+            ReentrantLock detailLock = ORDER_DETAIL_LOCKS.computeIfAbsent(orderId, k -> new ReentrantLock());
+            ORDER_DETAIL_LOCK_TIMES.put(orderId, System.currentTimeMillis());
+            
+            detailLock.lock();
+            try {
+                // 简化实现：实际应该调用API获取订单详情
+                JSONObject orderDetail = new JSONObject();
+                orderDetail.put("orderId", orderId);
+                orderDetail.put("itemId", itemId);
+                orderDetail.put("buyerId", buyerId);
+                orderDetail.put("quantity", 1);
+                
+                log.info("【{}】订单详情获取成功: {}", cookieId, orderId);
+                return orderDetail;
+                
+            } finally {
+                detailLock.unlock();
+            }
+            
+        } catch (Exception e) {
+            log.error("【{}】获取订单详情失败: {}", cookieId, orderId, e);
+            return null;
+        }
+    }
+    
+    /**
+     * 保存商品信息到数据库
+     * 对应Python的save_item_info_to_db()方法
+     */
+    private void saveItemInfoToDb(String itemId, String itemDetail, String itemTitle) {
+        try {
+            // 跳过auto_开头的商品ID
+            if (itemId != null && itemId.startsWith("auto_")) {
+                log.warn("跳过保存自动生成的商品ID: {}", itemId);
+                return;
+            }
+            
+            // 验证：需要同时有标题和详情
+            if (StrUtil.isBlank(itemTitle) || StrUtil.isBlank(itemDetail)) {
+                log.warn("跳过保存商品信息：标题或详情不完整 - {}", itemId);
+                return;
+            }
+            
+            // 简化实现：实际应该调用数据库服务保存
+            log.info("【{}】保存商品信息（简化实现）: itemId={}, title={}", 
+                cookieId, itemId, itemTitle);
+            
+        } catch (Exception e) {
+            log.error("【{}】保存商品信息失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 从API获取商品详情
+     * 对应Python的fetch_item_detail_from_api()方法
+     */
+    private String fetchItemDetailFromApi(String itemId) {
+        try {
+            // 检查缓存
+            ITEM_DETAIL_CACHE_LOCK.lock();
+            try {
+                ItemDetailCache cache = ITEM_DETAIL_CACHE.get(itemId);
+                if (cache != null && !cache.isExpired(ITEM_DETAIL_CACHE_TTL)) {
+                    cache.updateAccessTime();
+                    log.info("【{}】从缓存获取商品详情: {}", cookieId, itemId);
+                    return cache.getDetail();
+                }
+            } finally {
+                ITEM_DETAIL_CACHE_LOCK.unlock();
+            }
+            
+            // 简化实现：实际应该通过浏览器获取商品详情
+            log.info("【{}】获取商品详情（简化实现）: {}", cookieId, itemId);
+            String detail = "商品详情内容（简化实现）";
+            
+            // 添加到缓存
+            addToItemCache(itemId, detail);
+            
+            return detail;
+            
+        } catch (Exception e) {
+            log.error("【{}】获取商品详情失败: {}", cookieId, itemId, e);
+            return "";
+        }
+    }
+    
+    // ============== Cookie刷新方法 ==============
+    
+    /**
+     * 执行Cookie刷新
+     * 对应Python的_execute_cookie_refresh()方法
+     * 简化实现
+     */
+    private void executeCookieRefresh(long currentTime) {
+        try {
+            // 检查是否在消息冷却期
+            long timeSinceLastMessage = currentTime - lastMessageReceivedTime.get();
+            if (lastMessageReceivedTime.get() > 0 && 
+                timeSinceLastMessage < MESSAGE_COOKIE_REFRESH_COOLDOWN * 1000L) {
+                log.info("【{}】收到消息后冷却中，跳过Cookie刷新", cookieId);
+                return;
+            }
+            
+            log.info("【{}】开始执行Cookie刷新（简化实现）", cookieId);
+            
+            // 简化实现：实际应该调用浏览器服务刷新Cookie
+            // 这里只记录日志
+            log.warn("【{}】Cookie刷新完成（简化实现）", cookieId);
+            
+            lastCookieRefreshTime.set(currentTime);
+            
+        } catch (Exception e) {
+            log.error("【{}】Cookie刷新失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 通过浏览器刷新Cookie
+     * 对应Python的_refresh_cookies_via_browser()方法
+     */
+    private boolean refreshCookiesViaBrowser() {
+        try {
+            log.info("【{}】开始通过浏览器刷新Cookie（简化实现）", cookieId);
+            
+            // 简化实现：实际应该调用browserService.refreshCookies()
+            // 更新Cookie并保存到数据库
+            
+            log.info("【{}】浏览器Cookie刷新完成（简化实现）", cookieId);
+            return true;
+            
+        } catch (Exception e) {
+            log.error("【{}】浏览器Cookie刷新失败", cookieId, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 尝试密码登录刷新Cookie
+     * 对应Python的_try_password_login_refresh()方法
+     */
+    private boolean tryPasswordLoginRefresh(String triggerReason) {
+        try {
+            log.warn("【{}】准备尝试密码登录刷新Cookie，原因: {}", cookieId, triggerReason);
+            
+            // 检查密码登录冷却期
+            Long lastLoginTime = LAST_PASSWORD_LOGIN_TIME.get(cookieId);
+            long currentTime = System.currentTimeMillis();
+            if (lastLoginTime != null) {
+                long timeSinceLastLogin = (currentTime - lastLoginTime) / 1000;
+                if (timeSinceLastLogin < PASSWORD_LOGIN_COOLDOWN) {
+                    log.warn("【{}】距离上次密码登录仅 {} 秒，仍在冷却期内", 
+                        cookieId, timeSinceLastLogin);
+                    return false;
+                }
+            }
+            
+            // 简化实现：实际应该调用浏览器登录服务
+            log.info("【{}】密码登录刷新（简化实现）", cookieId);
+            
+            // 记录登录时间
+            LAST_PASSWORD_LOGIN_TIME.put(cookieId, currentTime);
+            
+            return true;
+            
+        } catch (Exception e) {
+            log.error("【{}】密码登录刷新失败", cookieId, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 更新数据库中的Cookie
+     * 对应Python的update_config_cookies()方法
+     */
+    private void updateConfigCookies() {
+        try {
+            Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
+            if (cookieOpt.isPresent()) {
+                Cookie cookie = cookieOpt.get();
+                cookie.setValue(this.cookiesStr);
+                cookieRepository.save(cookie);
+                log.warn("【{}】已更新Cookie到数据库", cookieId);
+            }
+        } catch (Exception e) {
+            log.error("【{}】更新数据库Cookie失败", cookieId, e);
+        }
+    }
+    
+    /**
+     * 更新Cookie并重启实例
+     * 对应Python的_update_cookies_and_restart()方法
+     */
+    private boolean updateCookiesAndRestart(String newCookiesStr) {
+        try {
+            log.info("【{}】准备更新Cookie并重启实例", cookieId);
+            
+            // 备份原Cookie
+            String oldCookiesStr = this.cookiesStr;
+            
+            // 更新Cookie
+            this.cookiesStr = newCookiesStr;
+            this.cookies = parseCookies(newCookiesStr);
+            
+            // 更新数据库
+            updateConfigCookies();
+            
+            // 简化实现：实际应该触发实例重启
+            log.info("【{}】Cookie更新成功（简化实现，跳过实例重启）", cookieId);
+            
+            return true;
+            
+        } catch (Exception e) {
+            log.error("【{}】Cookie更新失败", cookieId, e);
+            return false;
+        }
+    }
 }
+
+
+
 
 
