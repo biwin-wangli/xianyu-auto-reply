@@ -2,6 +2,7 @@ package com.xianyu.autoreply.controller;
 
 import com.xianyu.autoreply.entity.SystemSetting;
 import com.xianyu.autoreply.repository.SystemSettingRepository;
+import com.xianyu.autoreply.service.TokenService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -19,12 +20,14 @@ import java.util.stream.Collectors;
  */
 @RestController
 @RequestMapping("/system-settings")
-public class SystemSettingController {
+public class SystemSettingController extends BaseController {
 
     private final SystemSettingRepository systemSettingRepository;
 
     @Autowired
-    public SystemSettingController(SystemSettingRepository systemSettingRepository) {
+    public SystemSettingController(SystemSettingRepository systemSettingRepository,
+                                   TokenService tokenService) {
+        super(tokenService);
         this.systemSettingRepository = systemSettingRepository;
     }
 

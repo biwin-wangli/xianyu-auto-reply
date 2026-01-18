@@ -2,6 +2,7 @@ package com.xianyu.autoreply.controller;
 
 import com.xianyu.autoreply.entity.SystemSetting;
 import com.xianyu.autoreply.repository.SystemSettingRepository;
+import com.xianyu.autoreply.service.TokenService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -16,12 +17,14 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/system")
-public class SystemController {
+public class SystemController extends BaseController {
 
     private final SystemSettingRepository systemSettingRepository;
 
     @Autowired
-    public SystemController(SystemSettingRepository systemSettingRepository) {
+    public SystemController(SystemSettingRepository systemSettingRepository,
+                            TokenService tokenService) {
+        super(tokenService);
         this.systemSettingRepository = systemSettingRepository;
     }
 
@@ -41,10 +44,10 @@ public class SystemController {
         // In real app, fetch from DB. For now, mock or fetch if safe.
         // Python code filters keys: registration_enabled, show_default_login_info, login_captcha_enabled
         // We can reuse getSettings() and filter.
-        
+
         List<SystemSetting> all = systemSettingRepository.findAll();
         Map<String, String> publicSettings = new java.util.HashMap<>();
-        
+
         // Defaults
         publicSettings.put("registration_enabled", "true");
         publicSettings.put("show_default_login_info", "true");
@@ -52,9 +55,9 @@ public class SystemController {
 
         for (SystemSetting setting : all) {
             String key = setting.getKey();
-            if ("registration_enabled".equals(key) || 
-                "show_default_login_info".equals(key) || 
-                "login_captcha_enabled".equals(key)) {
+            if ("registration_enabled".equals(key) ||
+                    "show_default_login_info".equals(key) ||
+                    "login_captcha_enabled".equals(key)) {
                 publicSettings.put(key, setting.getValue());
             }
         }
@@ -66,7 +69,7 @@ public class SystemController {
     public Map<String, Object> checkVersion() {
         // In Python this calls an external URL. 
         // We return a dummy response or implement the HTTP call using Hutool if needed.
-        return Collections.singletonMap("version", "1.0.0"); 
+        return Collections.singletonMap("version", "1.0.0");
     }
 
     @GetMapping("/version/changelog")

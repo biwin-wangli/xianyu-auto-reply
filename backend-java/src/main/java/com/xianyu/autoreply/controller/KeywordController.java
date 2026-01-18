@@ -35,7 +35,7 @@ import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping
-public class KeywordController {
+public class KeywordController extends BaseController {
 
     private final KeywordRepository keywordRepository;
     private final DefaultReplyRepository defaultReplyRepository;
@@ -43,7 +43,6 @@ public class KeywordController {
     private final AiReplySettingRepository aiReplySettingRepository;
     private final CookieRepository cookieRepository;
     private final AiReplyService aiReplyService;
-    private final TokenService tokenService;
 
     @Autowired
     public KeywordController(KeywordRepository keywordRepository,
@@ -53,13 +52,13 @@ public class KeywordController {
                              CookieRepository cookieRepository,
                              AiReplyService aiReplyService,
                              TokenService tokenService) {
+        super(tokenService);
         this.keywordRepository = keywordRepository;
         this.defaultReplyRepository = defaultReplyRepository;
         this.defaultReplyRecordRepository = defaultReplyRecordRepository;
         this.aiReplySettingRepository = aiReplySettingRepository;
         this.cookieRepository = cookieRepository;
         this.aiReplyService = aiReplyService;
-        this.tokenService = tokenService;
     }
 
     // ------------------------- Keywords -------------------------

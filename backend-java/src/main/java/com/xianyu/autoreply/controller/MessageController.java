@@ -1,5 +1,7 @@
 package com.xianyu.autoreply.controller;
 
+import com.xianyu.autoreply.repository.SystemSettingRepository;
+import com.xianyu.autoreply.service.TokenService;
 import com.xianyu.autoreply.service.XianyuClient;
 import com.xianyu.autoreply.service.XianyuClientService;
 import lombok.Data;
@@ -11,17 +13,19 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/send-message")
-public class MessageController {
+public class MessageController extends BaseController {
 
     private final XianyuClientService xianyuClientService;
-    private final com.xianyu.autoreply.repository.SystemSettingRepository systemSettingRepository;
+    private final SystemSettingRepository systemSettingRepository;
     
     // Default key matching Python's API_SECRET_KEY
     private static final String DEFAULT_API_KEY = "xianyu_api_secret_2024";
 
     @Autowired
     public MessageController(XianyuClientService xianyuClientService, 
-                             com.xianyu.autoreply.repository.SystemSettingRepository systemSettingRepository) {
+                             SystemSettingRepository systemSettingRepository,
+                             TokenService tokenService) {
+        super(tokenService);
         this.xianyuClientService = xianyuClientService;
         this.systemSettingRepository = systemSettingRepository;
     }

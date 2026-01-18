@@ -2,6 +2,7 @@ package com.xianyu.autoreply.service;
 
 import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.repository.CookieRepository;
+import com.xianyu.autoreply.repository.ItemInfoRepository;
 import com.xianyu.autoreply.service.captcha.CaptchaHandler;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -23,17 +24,19 @@ public class XianyuClientService {
     private final PauseManager pauseManager;
     private final OrderStatusHandler orderStatusHandler;
     private final Map<String, XianyuClient> clients = new ConcurrentHashMap<>();
+    private final ItemInfoRepository itemInfoRepository;
 
     @Autowired
-    public XianyuClientService(CookieRepository cookieRepository, ReplyService replyService, 
+    public XianyuClientService(CookieRepository cookieRepository, ReplyService replyService,
                                CaptchaHandler captchaHandler, BrowserService browserService,
-                               PauseManager pauseManager, OrderStatusHandler orderStatusHandler) {
+                               PauseManager pauseManager, OrderStatusHandler orderStatusHandler, ItemInfoRepository itemInfoRepository) {
         this.cookieRepository = cookieRepository;
         this.replyService = replyService;
         this.captchaHandler = captchaHandler;
         this.browserService = browserService;
         this.pauseManager = pauseManager;
         this.orderStatusHandler = orderStatusHandler;
+        this.itemInfoRepository = itemInfoRepository;
     }
 
     @PostConstruct
@@ -52,8 +55,9 @@ public class XianyuClientService {
             log.warn("Client {} already running", cookieId);
             return;
         }
-        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService, 
-                                              captchaHandler, browserService, pauseManager, orderStatusHandler);
+        XianyuClient client = new XianyuClient(cookieId, cookieRepository, replyService,
+                captchaHandler, browserService, pauseManager, orderStatusHandler,
+                itemInfoRepository);
         clients.put(cookieId, client);
         client.start();
     }
@@ -64,7 +68,7 @@ public class XianyuClientService {
             client.stop();
         }
     }
-    
+
     public XianyuClient getClient(String cookieId) {
         return clients.get(cookieId);
     }

@@ -27,34 +27,27 @@ import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/cookies")
-public class CookieController {
+public class CookieController extends BaseController {
 
     private final CookieRepository cookieRepository;
     private final XianyuClientService xianyuClientService;
     private final BrowserService browserService;
-    private final TokenService tokenService;
 
     @Autowired
     public CookieController(CookieRepository cookieRepository,
                             XianyuClientService xianyuClientService,
                             BrowserService browserService,
                             TokenService tokenService) {
+        super(tokenService);
         this.cookieRepository = cookieRepository;
         this.xianyuClientService = xianyuClientService;
         this.browserService = browserService;
-        this.tokenService = tokenService;
     }
 
-    // Helper to get user ID
-    private Long getUserId(String token) {
-        if (token == null) throw new RuntimeException("Unauthorized");
-        String rawToken = token.replace("Bearer ", "");
-        TokenService.TokenInfo info = tokenService.verifyToken(rawToken);
-        if (info == null) throw new RuntimeException("Unauthorized");
-        return info.userId;
-    }
+
 
     private void checkOwnership(Cookie cookie, Long userId) {
+        if (isAdmin(userId)) return;
         if (cookie != null && !cookie.getUserId().equals(userId)) {
             throw new RuntimeException("Forbidden: You do not own this cookie");
         }
@@ -63,6 +56,9 @@ public class CookieController {
     @GetMapping
     public List<Cookie> listCookies(@RequestHeader(value = "Authorization", required = false) String token) {
         Long userId = getUserId(token);
+        if (isAdmin(userId)) {
+            return cookieRepository.findAll();
+        }
         // Repository needs a method findByUserId. Assuming it exists.
         return cookieRepository.findByUserId(userId);
     }

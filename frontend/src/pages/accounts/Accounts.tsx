@@ -637,6 +637,7 @@ export function Accounts() {
             <thead>
               <tr>
                 <th>账号ID</th>
+                <th>备注</th>
                 <th>关键词</th>
                 <th>状态</th>
                 <th>AI回复</th>
@@ -658,6 +659,7 @@ export function Accounts() {
                 accounts.map((account) => (
                   <tr key={account.id}>
                     <td className="font-medium text-blue-600 dark:text-blue-400">{account.id}</td>
+                    <td className="font-medium text-blue-600 dark:text-blue-400">{account.remark}</td>
                     <td>
                       <span className="inline-flex items-center gap-1.5 text-sm">
                         <MessageSquare className="w-3.5 h-3.5 text-blue-500" />

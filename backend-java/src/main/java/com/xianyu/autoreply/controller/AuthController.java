@@ -17,18 +17,18 @@ import java.util.Map;
 @Slf4j
 @RestController
 @RequestMapping
-public class AuthController {
+public class AuthController extends BaseController {
 
     private final AuthService authService;
-    private final TokenService tokenService;
-    
+
     private static final String ADMIN_USERNAME = "admin";
     private static final String DEFAULT_ADMIN_PASSWORD = "admin123";
 
     @Autowired
-    public AuthController(AuthService authService, TokenService tokenService) {
+    public AuthController(AuthService authService,
+                          TokenService tokenService) {
+        super(tokenService);
         this.authService = authService;
-        this.tokenService = tokenService;
     }
 
     /**
@@ -69,7 +69,7 @@ public class AuthController {
             loginType = "用户名/密码";
             log.info("【{}】尝试用户名登录", request.getUsername());
             user = authService.verifyUserPassword(request.getUsername(), request.getPassword());
-        } 
+        }
         // 2. 邮箱/密码登录
         else if (StrUtil.isNotBlank(request.getEmail()) && StrUtil.isNotBlank(request.getPassword())) {
             loginType = "邮箱/密码";
@@ -95,15 +95,15 @@ public class AuthController {
         if (user != null) {
             boolean isAdmin = ADMIN_USERNAME.equals(user.getUsername());
             String token = tokenService.generateToken(user, isAdmin);
-            
+
             log.info("【{}#{}】{}登录成功{}", user.getUsername(), user.getId(), loginType, isAdmin ? "（管理员）" : "");
-            
+
             return new LoginResponse(true, token, "登录成功", user.getId(), user.getUsername(), isAdmin);
         } else {
             log.warn("{}登录失败", loginType);
             if (loginType.contains("验证码")) {
                 // 这个分支其实上面已经处理了，这里是兜底逻辑
-                 return new LoginResponse(false, "用户不存在");
+                return new LoginResponse(false, "用户不存在");
             }
             return new LoginResponse(false, "用户名或密码错误"); // 或邮箱或密码错误
         }
@@ -117,7 +117,7 @@ public class AuthController {
     public Map<String, Object> verify(HttpServletRequest request) {
         String token = getTokenFromRequest(request);
         TokenService.TokenInfo info = tokenService.verifyToken(token);
-        
+
         Map<String, Object> response = new HashMap<>();
         if (info != null) {
             response.put("authenticated", true);
@@ -142,7 +142,7 @@ public class AuthController {
         response.put("message", "已登出");
         return response;
     }
-    
+
     /**
      * 修改管理员密码接口
      * 对应 Python: /change-admin-password
@@ -151,12 +151,12 @@ public class AuthController {
     public Map<String, Object> changeAdminPassword(@RequestBody ChangePasswordRequest request, HttpServletRequest httpRequest) {
         String token = getTokenFromRequest(httpRequest);
         TokenService.TokenInfo info = tokenService.verifyToken(token);
-        
+
         Map<String, Object> response = new HashMap<>();
         if (info == null || !info.isAdmin) {
-             response.put("success", false);
-             response.put("message", "未授权访问或非管理员");
-             return response;
+            response.put("success", false);
+            response.put("message", "未授权访问或非管理员");
+            return response;
         }
 
         User user = authService.verifyUserPassword(ADMIN_USERNAME, request.getCurrent_password());
@@ -177,7 +177,7 @@ public class AuthController {
         }
         return response;
     }
-    
+
     /**
      * 普通用户修改密码接口
      * 对应 Python: /change-password
@@ -186,19 +186,19 @@ public class AuthController {
     public Map<String, Object> changeUserPassword(@RequestBody ChangePasswordRequest request, HttpServletRequest httpRequest) {
         String token = getTokenFromRequest(httpRequest);
         TokenService.TokenInfo info = tokenService.verifyToken(token);
-        
+
         Map<String, Object> response = new HashMap<>();
         if (info == null) {
-             response.put("success", false);
-             response.put("message", "无法获取用户信息");
-             return response;
+            response.put("success", false);
+            response.put("message", "无法获取用户信息");
+            return response;
         }
 
         User user = authService.verifyUserPassword(info.username, request.getCurrent_password());
         if (user == null) {
-             response.put("success", false);
-             response.put("message", "当前密码错误");
-             return response;
+            response.put("success", false);
+            response.put("message", "当前密码错误");
+            return response;
         }
 
         boolean success = authService.updateUserPassword(info.username, request.getNew_password());
@@ -212,7 +212,7 @@ public class AuthController {
         }
         return response;
     }
-    
+
     /**
      * 检查是否使用默认密码
      * 对应 Python: /api/check-default-password
@@ -221,13 +221,13 @@ public class AuthController {
     public Map<String, Boolean> checkDefaultPassword(HttpServletRequest httpRequest) {
         String token = getTokenFromRequest(httpRequest);
         TokenService.TokenInfo info = tokenService.verifyToken(token);
-        
+
         Map<String, Boolean> response = new HashMap<>();
         if (info == null || !info.isAdmin) {
-             response.put("using_default", false);
-             return response;
+            response.put("using_default", false);
+            return response;
         }
-        
+
         User adminUser = authService.verifyUserPassword(ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD);
         response.put("using_default", adminUser != null);
         return response;
@@ -272,7 +272,7 @@ public class AuthController {
             this.is_admin = isAdmin;
         }
     }
-    
+
     @Data
     public static class ChangePasswordRequest {
         private String current_password;

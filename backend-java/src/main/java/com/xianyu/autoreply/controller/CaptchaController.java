@@ -2,6 +2,7 @@ package com.xianyu.autoreply.controller;
 
 import com.xianyu.autoreply.entity.CaptchaCode;
 import com.xianyu.autoreply.repository.CaptchaCodeRepository;
+import com.xianyu.autoreply.service.TokenService;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,12 +16,14 @@ import java.util.Map;
 @Slf4j
 @RestController
 // 注意：移除了类级别的 @RequestMapping("/api/captcha")，改用方法级别的根路径映射
-public class CaptchaController {
+public class CaptchaController extends BaseController {
 
     private final CaptchaCodeRepository captchaCodeRepository;
 
     @Autowired
-    public CaptchaController(CaptchaCodeRepository captchaCodeRepository) {
+    public CaptchaController(CaptchaCodeRepository captchaCodeRepository,
+                             TokenService tokenService) {
+        super(tokenService);
         this.captchaCodeRepository = captchaCodeRepository;
     }
 

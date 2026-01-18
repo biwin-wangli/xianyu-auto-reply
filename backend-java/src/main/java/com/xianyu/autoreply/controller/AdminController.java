@@ -31,15 +31,14 @@ import java.util.stream.Stream;
 @Slf4j
 @RestController
 @RequestMapping
-public class AdminController {
+public class AdminController extends BaseController {
 
     private final UserRepository userRepository;
     private final CookieRepository cookieRepository;
     private final OrderRepository orderRepository;
     private final CardRepository cardRepository;
     private final KeywordRepository keywordRepository;
-    private final TokenService tokenService;
-    
+
     // Log directory - adjust as needed for migration context
     private final String LOG_DIR = "logs";
 
@@ -50,12 +49,12 @@ public class AdminController {
                            CardRepository cardRepository,
                            KeywordRepository keywordRepository,
                            TokenService tokenService) {
+        super(tokenService);
         this.userRepository = userRepository;
         this.cookieRepository = cookieRepository;
         this.orderRepository = orderRepository;
         this.cardRepository = cardRepository;
         this.keywordRepository = keywordRepository;
-        this.tokenService = tokenService;
     }
 
     // ------------------------- User Management -------------------------

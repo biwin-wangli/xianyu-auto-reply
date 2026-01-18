@@ -8,6 +8,7 @@ import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.repository.CookieRepository;
 import com.xianyu.autoreply.repository.MessageNotificationRepository;
 import com.xianyu.autoreply.repository.NotificationChannelRepository;
+import com.xianyu.autoreply.service.TokenService;
 import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -22,7 +23,7 @@ import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping
-public class NotificationController {
+public class NotificationController extends BaseController {
 
     private final NotificationChannelRepository channelRepository;
     private final MessageNotificationRepository notificationRepository;
@@ -31,7 +32,9 @@ public class NotificationController {
     @Autowired
     public NotificationController(NotificationChannelRepository channelRepository,
                                   MessageNotificationRepository notificationRepository,
-                                  CookieRepository cookieRepository) {
+                                  CookieRepository cookieRepository,
+                                  TokenService tokenService) {
+        super(tokenService);
         this.channelRepository = channelRepository;
         this.notificationRepository = notificationRepository;
         this.cookieRepository = cookieRepository;

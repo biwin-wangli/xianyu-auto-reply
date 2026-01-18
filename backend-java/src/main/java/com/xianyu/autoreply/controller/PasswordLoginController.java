@@ -1,6 +1,7 @@
 package com.xianyu.autoreply.controller;
 
 import com.xianyu.autoreply.service.BrowserService;
+import com.xianyu.autoreply.service.TokenService;
 import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
@@ -9,15 +10,15 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
-public class PasswordLoginController {
+public class PasswordLoginController extends BaseController {
 
     private final BrowserService browserService;
-    private final com.xianyu.autoreply.service.TokenService tokenService;
 
     @Autowired
-    public PasswordLoginController(BrowserService browserService, com.xianyu.autoreply.service.TokenService tokenService) {
+    public PasswordLoginController(BrowserService browserService,
+                                   TokenService tokenService) {
+        super(tokenService);
         this.browserService = browserService;
-        this.tokenService = tokenService;
     }
 
     @PostMapping("/password-login")

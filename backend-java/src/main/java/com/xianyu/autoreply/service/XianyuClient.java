@@ -6,9 +6,11 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.xianyu.autoreply.entity.Cookie;
+import com.xianyu.autoreply.entity.ItemInfo;
 import com.xianyu.autoreply.model.ItemDetailCache;
 import com.xianyu.autoreply.model.LockHoldInfo;
 import com.xianyu.autoreply.repository.CookieRepository;
+import com.xianyu.autoreply.repository.ItemInfoRepository;
 import com.xianyu.autoreply.service.captcha.CaptchaHandler;
 import com.xianyu.autoreply.utils.XianyuUtils;
 import jakarta.websocket.ContainerProvider;
@@ -97,6 +99,7 @@ public class XianyuClient extends TextWebSocketHandler {
     private final BrowserService browserService;
     private final PauseManager pauseManager; // 暂停管理器
     private final OrderStatusHandler orderStatusHandler; // 订单状态处理器
+    private final ItemInfoRepository itemInfoRepository; // 商品信息存储库
 
     private String cookiesStr; // Cookie字符串
     private Map<String, String> cookies; // Cookie字典
@@ -217,7 +220,8 @@ public class XianyuClient extends TextWebSocketHandler {
     public XianyuClient(String cookieId, CookieRepository cookieRepository,
                         ReplyService replyService, CaptchaHandler captchaHandler,
                         BrowserService browserService, PauseManager pauseManager,
-                        OrderStatusHandler orderStatusHandler) {
+                        OrderStatusHandler orderStatusHandler,
+                        ItemInfoRepository itemInfoRepository) {
         this.cookieId = cookieId;
         this.cookieRepository = cookieRepository;
         this.replyService = replyService;
@@ -225,6 +229,7 @@ public class XianyuClient extends TextWebSocketHandler {
         this.browserService = browserService;
         this.pauseManager = pauseManager;
         this.orderStatusHandler = orderStatusHandler;
+        this.itemInfoRepository = itemInfoRepository;
 
         // 创建HTTP客户端
         this.httpClient = new OkHttpClient.Builder()
@@ -3496,9 +3501,326 @@ public class XianyuClient extends TextWebSocketHandler {
             return false;
         }
     }
+
+    // ============== 商品信息获取相关方法（对应Python XianyuLive.get_all_items系列方法）==============
+
+    /**
+     * 获取所有商品信息（自动分页）
+     * 对应Python: async def get_all_items(self, page_size=20, max_pages=None)
+     *
+     * @param pageSize 每页数量，默认20
+     * @param maxPages 最大页数限制，null表示无限制
+     * @return 包含所有商品信息的Map
+     */
+    public Map<String, Object> getAllItems(int pageSize, Integer maxPages) {
+        log.info("【{}】开始获取所有商品信息，每页{}条", cookieId, pageSize);
+
+        int pageNumber = 1;
+        int totalSaved = 0;
+        int totalCount = 0;
+
+        while (true) {
+            if (maxPages != null && pageNumber > maxPages) {
+                log.info("【{}】达到最大页数限制 {}，停止获取", cookieId, maxPages);
+                break;
+            }
+
+            log.info("【{}】正在获取第 {} 页...", cookieId, pageNumber);
+            Map<String, Object> result = getItemListInfo(pageNumber, pageSize, 0);
+
+            if (!Boolean.TRUE.equals(result.get("success"))) {
+                log.error("【{}】获取第 {} 页失败: {}", cookieId, pageNumber, result.get("error"));
+                return Map.of(
+                        "success", false,
+                        "error", result.getOrDefault("error", "获取商品失败"),
+                        "total_pages", pageNumber - 1,
+                        "total_count", totalCount,
+                        "total_saved", totalSaved
+                );
+            }
+
+            @SuppressWarnings("unchecked")
+            java.util.List<Map<String, Object>> currentItems = (java.util.List<Map<String, Object>>) result.get("items");
+            if (currentItems == null || currentItems.isEmpty()) {
+                log.info("【{}】第 {} 页没有数据，获取完成", cookieId, pageNumber);
+                break;
+            }
+
+            totalCount += currentItems.size();
+            Integer savedCount = (Integer) result.get("saved_count");
+            if (savedCount != null) {
+                totalSaved += savedCount;
+            }
+
+            log.info("【{}】第 {} 页获取到 {} 个商品", cookieId, pageNumber, currentItems.size());
+
+            // 如果当前页商品数量少于页面大小，说明已经是最后一页
+            if (currentItems.size() < pageSize) {
+                log.info("【{}】第 {} 页商品数量({})少于页面大小({})，获取完成",
+                        cookieId, pageNumber, currentItems.size(), pageSize);
+                break;
+            }
+
+            pageNumber++;
+
+            // 添加延迟避免请求过快
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("【{}】获取商品时被中断", cookieId);
+                break;
+            }
+        }
+
+        log.info("【{}】所有商品获取完成，共 {} 个商品，保存了 {} 个", cookieId, totalCount, totalSaved);
+
+        return Map.of(
+                "success", true,
+                "total_pages", pageNumber,
+                "total_count", totalCount,
+                "total_saved", totalSaved
+        );
+    }
+
+    /**
+     * 获取商品列表信息（单页）
+     * 对应Python: async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0)
+     *
+     * @param pageNumber 页码，从1开始
+     * @param pageSize   每页数量
+     * @param retryCount 重试次数（内部使用）
+     * @return 包含商品列表的Map
+     */
+    private Map<String, Object> getItemListInfo(int pageNumber, int pageSize, int retryCount) {
+        if (retryCount >= 4) {
+            log.error("【{}】获取商品信息失败，重试次数过多", cookieId);
+            return Map.of("error", "获取商品信息失败，重试次数过多");
+        }
+
+        try {
+            // 构建请求参数
+            long timestamp = System.currentTimeMillis();
+            Map<String, String> params = new HashMap<>();
+            params.put("jsv", "2.7.2");
+            params.put("appKey", API_APP_KEY);
+            params.put("t", String.valueOf(timestamp));
+            params.put("sign", "");
+            params.put("v", "1.0");
+            params.put("type", "originaljson");
+            params.put("accountSite", "xianyu");
+            params.put("dataType", "json");
+            params.put("timeout", "20000");
+            params.put("api", "mtop.idle.web.xyh.item.list");
+            params.put("sessionOption", "AutoLoginOnly");
+            params.put("spm_cnt", "a21ybx.im.0.0");
+            params.put("spm_pre", "a21ybx.collection.menu.1.272b5141NafCNK");
+
+            // 构建数据
+            Map<String, Object> dataMap = new HashMap<>();
+            dataMap.put("needGroupInfo", false);
+            dataMap.put("pageNumber", pageNumber);
+            dataMap.put("pageSize", pageSize);
+            dataMap.put("groupName", "在售");
+            dataMap.put("groupId", "58877261");
+            dataMap.put("defaultGroup", true);
+            dataMap.put("userId", myId);
+
+            String dataVal = JSON.toJSONString(dataMap);
+
+            // 从cookie中获取token
+            String mh5tk = cookies.get("_m_h5_tk");
+            String token = "";
+            if (mh5tk != null && mh5tk.contains("_")) {
+                token = mh5tk.split("_")[0];
+            }
+
+            log.warn("【{}】准备获取商品列表，token: {}", cookieId, token);
+
+            // 生成签名
+            String sign = XianyuUtils.generateSign(String.valueOf(timestamp), token, dataVal);
+            params.put("sign", sign);
+
+            // 发送HTTP请求
+            String url = "https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/";
+            cn.hutool.http.HttpRequest request = HttpRequest.post(url)
+                    .form("data", dataVal)
+                    .cookie(cookiesStr);
+            
+            // 添加所有params参数
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                request.form(entry.getKey(), entry.getValue());
+            }
+            
+            String responseBody = request.execute().body();
+
+            JSONObject resJson = JSON.parseObject(responseBody);
+            log.info("【{}】商品信息获取响应: {}", cookieId, resJson.toJSONString());
+
+            // 检查响应是否成功
+            JSONArray retArray = resJson.getJSONArray("ret");
+            if (retArray != null && !retArray.isEmpty() && "SUCCESS::调用成功".equals(retArray.getString(0))) {
+                JSONObject itemsData = resJson.getJSONObject("data");
+                JSONArray cardList = itemsData.getJSONArray("cardList");
+
+                // 解析商品信息
+                java.util.List<Map<String, Object>> itemsList = new java.util.ArrayList<>();
+                if (cardList != null) {
+                    for (int i = 0; i < cardList.size(); i++) {
+                        JSONObject card = cardList.getJSONObject(i);
+                        JSONObject cardData = card.getJSONObject("cardData");
+                        if (cardData != null) {
+                            Map<String, Object> itemInfo = new HashMap<>();
+                            itemInfo.put("id", cardData.getString("id"));
+                            itemInfo.put("title", cardData.getString("title"));
+
+                            JSONObject priceInfo = cardData.getJSONObject("priceInfo");
+                            if (priceInfo != null) {
+                                itemInfo.put("price", priceInfo.getString("price"));
+                                String priceText = (priceInfo.getString("preText") != null ? priceInfo.getString("preText") : "") +
+                                        (priceInfo.getString("price") != null ? priceInfo.getString("price") : "");
+                                itemInfo.put("price_text", priceText);
+                            } else {
+                                itemInfo.put("price", "");
+                                itemInfo.put("price_text", "");
+                            }
+
+                            itemInfo.put("category_id", cardData.getString("categoryId"));
+                            itemInfo.put("auction_type", cardData.getString("auctionType"));
+                            itemInfo.put("item_status", cardData.getInteger("itemStatus"));
+                            itemInfo.put("detail_url", cardData.getString("detailUrl"));
+                            itemInfo.put("pic_info", cardData.getJSONObject("picInfo"));
+                            itemInfo.put("detail_params", cardData.getJSONObject("detailParams"));
+                            itemInfo.put("track_params", cardData.getJSONObject("trackParams"));
+                            itemInfo.put("item_label_data", cardData.getJSONObject("itemLabelDataVO"));
+                            itemInfo.put("card_type", card.getInteger("cardType"));
+
+                            itemsList.add(itemInfo);
+                        }
+                    }
+                }
+
+                log.info("【{}】成功获取到 {} 个商品", cookieId, itemsList.size());
+
+                // 打印商品详细信息到控制台
+                System.out.println("\n" + "=".repeat(80));
+                System.out.println(String.format("📦 账号 %s 的商品列表 (第%d页，%d 个商品)", myId, pageNumber, itemsList.size()));
+                System.out.println("=".repeat(80));
+
+                for (int i = 0; i < itemsList.size(); i++) {
+                    Map<String, Object> item = itemsList.get(i);
+                    System.out.println(String.format("\n🔸 商品 %d:", i + 1));
+                    System.out.println(String.format("   商品ID: %s", item.get("id")));
+                    System.out.println(String.format("   商品标题: %s", item.get("title")));
+                    System.out.println(String.format("   价格: %s", item.get("price_text")));
+                    System.out.println(String.format("   分类ID: %s", item.get("category_id")));
+                    System.out.println(String.format("   商品状态: %s", item.get("item_status")));
+                    System.out.println(String.format("   拍卖类型: %s", item.get("auction_type")));
+                    System.out.println(String.format("   详情链接: %s", item.get("detail_url")));
+                }
+
+                System.out.println("\n" + "=".repeat(80));
+                System.out.println("✅ 商品列表获取完成");
+                System.out.println("=".repeat(80));
+
+                // 自动保存商品信息到数据库
+                int savedCount = 0;
+                if (!itemsList.isEmpty()) {
+                    savedCount = saveItemsToDatabase(itemsList);
+                    log.info("【{}】已将 {} 个商品信息保存到数据库", cookieId, savedCount);
+                }
+
+                return Map.of(
+                        "success", true,
+                        "page_number", pageNumber,
+                        "page_size", pageSize,
+                        "current_count", itemsList.size(),
+                        "items", itemsList,
+                        "saved_count", savedCount
+                );
+            } else {
+                // 检查是否是token失效
+                String errorMsg = retArray != null && !retArray.isEmpty() ? retArray.getString(0) : "";
+                if (errorMsg.contains("FAIL_SYS_TOKEN_EXOIRED") || errorMsg.toLowerCase().contains("token")) {
+                    log.warn("【{}】Token失效，准备重试: {}", cookieId, errorMsg);
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return getItemListInfo(pageNumber, pageSize, retryCount + 1);
+                } else {
+                    log.error("【{}】获取商品信息失败: {}", cookieId, resJson.toJSONString());
+                    return Map.of("error", "获取商品信息失败: " + errorMsg);
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("【{}】商品信息API请求异常", cookieId, e);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            return getItemListInfo(pageNumber, pageSize,retryCount + 1);
+        }
+    }
+
+    /**
+     * 保存商品列表到数据库
+     * 对应Python: async def save_items_list_to_db(self, items_list)
+     *
+     * @param itemsList 商品列表
+     * @return 保存的商品数量
+     */
+    private int saveItemsToDatabase(java.util.List<Map<String, Object>> itemsList) {
+        int savedCount = 0;
+
+        try {
+            for (Map<String, Object> itemData : itemsList) {
+                try {
+                    String itemId = (String) itemData.get("id");
+                    if (itemId == null || itemId.isEmpty()) {
+                        log.warn("【{}】跳过保存：商品ID为空", cookieId);
+                        continue;
+                    }
+
+                    // 查找或创建商品实体
+                    ItemInfo itemInfo = itemInfoRepository.findByCookieIdAndItemId(cookieId, itemId)
+                            .orElse(new ItemInfo());
+
+                    // 设置字段
+                    itemInfo.setCookieId(cookieId);
+                    itemInfo.setItemId(itemId);
+                    itemInfo.setItemTitle((String) itemData.get("title"));
+                    itemInfo.setItemPrice((String) itemData.get("price"));
+
+                    // 尝试从 detail_params 中提取分类信息
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> detailParams = (Map<String, Object>) itemData.get("detail_params");
+                    if (detailParams != null) {
+                        Object categoryName = detailParams.get("categoryName");
+                        if (categoryName != null) {
+                            itemInfo.setItemCategory(categoryName.toString());
+                        }
+                    }
+
+                    // 保存到数据库
+                    itemInfoRepository.save(itemInfo);
+                    savedCount++;
+
+                } catch (Exception e) {
+                    log.error("【{}】保存商品信息失败: {}", cookieId, itemData.get("id"), e);
+                }
+            }
+
+            log.info("【{}】成功保存 {} 个商品到数据库", cookieId, savedCount);
+
+        } catch (Exception e) {
+            log.error("【{}】批量保存商品信息时出错", cookieId, e);
+        }
+
+        return savedCount;
+    }
 }
-
-
-
-
 

@@ -1,6 +1,7 @@
 package com.xianyu.autoreply.controller;
 
 import com.xianyu.autoreply.service.QrLoginService;
+import com.xianyu.autoreply.service.TokenService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -10,12 +11,14 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Map;
 
 @RestController
-public class QrLoginController {
+public class QrLoginController extends BaseController {
 
     private final QrLoginService qrLoginService;
 
     @Autowired
-    public QrLoginController(QrLoginService qrLoginService) {
+    public QrLoginController(QrLoginService qrLoginService,
+                             TokenService tokenService) {
+        super(tokenService);
         this.qrLoginService = qrLoginService;
     }
 

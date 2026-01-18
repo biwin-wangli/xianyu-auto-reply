@@ -1,17 +1,32 @@
 import { get, post, put, del } from '@/utils/request'
 import type { Account, AccountDetail, ApiResponse } from '@/types'
 
-// 获取账号列表（返回账号ID数组）
+// 获取账号列表（返回账号对象数组）
 export const getAccounts = async (): Promise<Account[]> => {
-  const ids: string[] = await get('/cookies')
-  // 后端返回的是账号ID数组，转换为Account对象数组
-  return ids.map(id => ({ 
-    id, 
-    cookie: '', 
-    enabled: true,
+  interface BackendAccount {
+    id: string
+    value: string
+    remark?: string
+    username?: string
+    password?: string
+    enabled: boolean
+    created_at?: string
+    updated_at?: string
+    user_id?: number
+    auto_confirm: boolean
+    pause_duration?: number
+    show_browser?: boolean
+  }
+  const data = await get<BackendAccount[]>('/cookies')
+  // 后端返回的是完整账号对象数组，转换为前端Account格式
+  return data.map(item => ({
+    id: item.id,
+    cookie: item.value || '',
+    remark: item.remark,
+    enabled: item.enabled,
     use_ai_reply: false,
     use_default_reply: false,
-    auto_confirm: false
+    auto_confirm: item.auto_confirm
   }))
 }
 
@@ -33,6 +48,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   return data.map((item) => ({
     id: item.id,
     cookie: item.value,
+    remark: item.remark,
     enabled: item.enabled,
     auto_confirm: item.auto_confirm,
     note: item.remark,

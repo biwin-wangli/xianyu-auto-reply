@@ -26,6 +26,7 @@ export interface LoginResponse {
 export interface Account {
   id: string
   cookie: string
+  remark?: string
   enabled: boolean
   use_ai_reply: boolean
   use_default_reply: boolean
@@ -109,14 +110,14 @@ export interface Order {
   updated_at?: string
 }
 
-export type OrderStatus = 
-  | 'processing' 
+export type OrderStatus =
+  | 'processing'
   | 'pending_ship'
-  | 'processed' 
-  | 'shipped' 
-  | 'completed' 
+  | 'processed'
+  | 'shipped'
+  | 'completed'
   | 'refunding'
-  | 'cancelled' 
+  | 'cancelled'
   | 'unknown'
 
 // 卡券相关类型
