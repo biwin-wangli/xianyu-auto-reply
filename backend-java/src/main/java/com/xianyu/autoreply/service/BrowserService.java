@@ -13,6 +13,7 @@ import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.resource.ResourceUrlProvider;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -25,18 +26,20 @@ import java.util.concurrent.ConcurrentHashMap;
 public class BrowserService {
 
     private final CookieRepository cookieRepository;
+    private final ResourceUrlProvider resourceUrlProvider;
     private Playwright playwright;
     private Browser browser;
 
     // 为每个账号维护持久化浏览器上下文（用于Cookie刷新）
     private final Map<String, BrowserContext> persistentContexts = new ConcurrentHashMap<>();
-    
+
     // 为每个账号维护同步锁，防止并发创建持久化上下文
     private final Map<String, Object> contextLocks = new ConcurrentHashMap<>();
 
     @Autowired
-    public BrowserService(CookieRepository cookieRepository) {
+    public BrowserService(CookieRepository cookieRepository, ResourceUrlProvider resourceUrlProvider) {
         this.cookieRepository = cookieRepository;
+        this.resourceUrlProvider = resourceUrlProvider;
     }
 
     @PostConstruct
@@ -523,6 +526,54 @@ public class BrowserService {
         return false;
     }
 
+    private boolean attemptQuickLogin(Frame frame) {
+        boolean containerFound = false;
+        if (Objects.isNull(frame)) return containerFound;
+        ElementHandle elementHandle = frame.querySelector("#alibaba-login-box");
+        if (Objects.isNull(elementHandle)) return containerFound;
+        Frame quickLoginFrame = elementHandle.contentFrame();
+        if (Objects.isNull(quickLoginFrame)) return containerFound;
+        ElementHandle loginButton = quickLoginFrame.querySelector(".fm-button.fm-submit");
+        if (Objects.isNull(loginButton)) return containerFound;
+        if (loginButton.isVisible()) {
+            loginButton.click();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean attemptQuickLoginV2(Frame frame) {
+        try {
+            String[] loginButtonSelectors = {".has-login", ".cm-has-login", ".fm-btn", ".fm-button", ".fm-submit"};
+
+            boolean containerFound = false;
+            for (String s : loginButtonSelectors) {
+                if (frame.querySelector(s) != null && frame.isVisible(s)) {
+                    containerFound = true;
+                    break;
+                }
+            }
+            if (!containerFound) return false;
+
+            ElementHandle loginButtonDialog = frame.querySelector(".has-login");
+            if (loginButtonDialog == null) loginButtonDialog = frame.querySelector(".cm-has-login");
+
+            if (loginButtonDialog != null && loginButtonDialog.isVisible()) {
+                log.info("【Login Task】Detected quick login in frame: {}", frame.url());
+
+                ElementHandle loginButton = frame.querySelector(".fm-button");
+                if (loginButton == null) loginButton = frame.querySelector(".fm-submit");
+                if (loginButton == null) return false;
+                loginButton.click();
+                log.info("【Login Task】quick login success!");
+                return true;
+            }
+        } catch (Exception e) {
+            log.warn("【Login Task】quick login fail : {}", e.getMessage());
+        }
+        return false;
+    }
+
     /**
      * 刷新Cookie - 使用持久化浏览器上下文
      * Cookie会自动保存到UserData目录，类似真实浏览器行为
@@ -574,8 +625,16 @@ public class BrowserService {
 
             // 3. 等待页面加载
             try {
-                Thread.sleep(3000);
+                Thread.sleep(5000);
             } catch (Exception e) {
+            }
+
+
+            // 判断是否有快捷登陆iframe
+            for (Frame frame : page.frames()) {
+                if (attemptQuickLogin(frame)) {
+                    break;
+                }
             }
 
             // 4. 重新加载页面以触发Cookie刷新
@@ -618,6 +677,7 @@ public class BrowserService {
             // 9. 更新数据库
             if (!newCookieStr.equals(cookie.getValue())) {
                 cookie.setValue(newCookieStr);
+                log.debug("【{}】🤖刷新浏览器后获取到的 cookie 为: {}", cookieId, newCookieStr);
                 cookieRepository.save(cookie);
                 log.info("【{}-Cookie Refresh】✅ Cookie已更新并保存到数据库: {}", cookieId, cookieId);
             } else {
@@ -652,7 +712,7 @@ public class BrowserService {
         log.info("【QR Login】Verifying cookies for account: {}", accountId);
 
         try (BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                .setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0")
+                        .setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0")
 //                .setViewportSize(1920, 1080)
         )) {
 
@@ -719,13 +779,13 @@ public class BrowserService {
     private BrowserContext getPersistentContext(String cookieId) {
         // 获取或创建该账号的同步锁
         Object lock = contextLocks.computeIfAbsent(cookieId, k -> new Object());
-        
+
         // 使用同步锁防止并发创建同一个上下文
         synchronized (lock) {
             return getPersistentContextInternal(cookieId);
         }
     }
-    
+
     /**
      * 内部方法：实际执行获取或创建上下文的逻辑
      */
@@ -829,7 +889,7 @@ public class BrowserService {
                 log.warn("【{}-Cookie Refresh】关闭失效上下文时出错: {}", cookieId, cookieId, e);
             }
         }
-        
+
         // 删除整个 UserData 目录，包括 SingletonLock 文件
         try {
             String userDataDir = "browser_data/cookie_refresh/" + cookieId;
@@ -842,7 +902,7 @@ public class BrowserService {
             log.warn("【{}-Cookie Refresh】删除UserData目录失败: {}", cookieId, e.getMessage());
         }
     }
-    
+
     /**
      * 递归删除目录
      */
@@ -850,13 +910,13 @@ public class BrowserService {
         if (java.nio.file.Files.isDirectory(path)) {
             try (java.util.stream.Stream<java.nio.file.Path> stream = java.nio.file.Files.walk(path)) {
                 stream.sorted(java.util.Comparator.reverseOrder())
-                      .forEach(p -> {
-                          try {
-                              java.nio.file.Files.delete(p);
-                          } catch (java.io.IOException e) {
-                              log.warn("删除文件失败: {}", p, e);
-                          }
-                      });
+                        .forEach(p -> {
+                            try {
+                                java.nio.file.Files.delete(p);
+                            } catch (java.io.IOException e) {
+                                log.warn("删除文件失败: {}", p, e);
+                            }
+                        });
             }
         }
     }

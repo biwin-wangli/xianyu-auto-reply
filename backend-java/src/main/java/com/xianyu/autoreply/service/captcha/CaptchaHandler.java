@@ -67,7 +67,7 @@ public class CaptchaHandler {
             dragSlider(sliderElement, distance, cookieId);
             
             // 检查是否成功
-            Thread.sleep(10000);
+            Thread.sleep(5000);
             boolean success = checkSuccess(verificationUrl, cookieId);
             
             if (success) {
@@ -249,7 +249,7 @@ public class CaptchaHandler {
         double randomX1 = 200 + Math.random() * 400; // 200-600px范围
         double randomY1 = 100 + Math.random() * 200; // 100-300px范围
         page.mouse().move(randomX1, randomY1);
-        page.mouse().click(randomX1, randomY1);
+        page.mouse().click(randomX1, randomY1, new Mouse.ClickOptions().setClickCount(1));
         Thread.sleep(100 + (long)(Math.random() * 200));
         
         // 2. 再移动到接近滑块的位置（但不是精确位置）

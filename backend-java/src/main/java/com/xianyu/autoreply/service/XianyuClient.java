@@ -356,14 +356,14 @@ public class XianyuClient extends TextWebSocketHandler {
 
 
     /**
-     * WebSocket连接循环 - 对应Python的main方法中的while True循环
+     * WebSocket连接循环 - 重构版本，去除嵌套
+     * 核心逻辑：外层循环保持运行，内部单次连接尝试，失败后延迟重试
      */
     private void connectionLoop() {
         while (running.get()) {
             try {
                 // 检查账号是否启用
-                Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
-                if (cookieOpt.isEmpty() || !Boolean.TRUE.equals(cookieOpt.get().getEnabled())) {
+                if (!isAccountEnabled()) {
                     log.info("【{}】账号已禁用，停止连接循环", cookieId);
                     break;
                 }
@@ -372,59 +372,108 @@ public class XianyuClient extends TextWebSocketHandler {
                 setConnectionState(ConnectionState.CONNECTING, "准备建立WebSocket连接");
                 log.info("【{}】WebSocket目标地址: {}", cookieId, WEBSOCKET_URL);
 
-                // 创建WebSocket连接
+                // 单次连接尝试
                 connectWebSocket();
 
-                // 连接成功后，等待连接断开
-                // WebSocket会在另一个线程中运行，这里需要阻塞等待
-                log.info("【{}】WebSocket连接已建立，等待连接断开...", cookieId);
-                while (connected.get() && running.get()) {
-                    try {
-                        Thread.sleep(1000); // 每秒检查一次连接状态
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
+                // 连接成功后，进入等待循环，直到连接断开
+                waitForDisconnection();
 
                 log.info("【{}】WebSocket连接已断开", cookieId);
 
             } catch (Exception e) {
+                // 统一处理连接错误
                 handleConnectionError(e);
             }
 
-            // 重连延迟
+            // 计算并执行重连延迟
             if (running.get()) {
                 int retryDelay = calculateRetryDelay(connectionFailures.get());
                 log.info("【{}】{}秒后尝试重连...", cookieId, retryDelay);
-                try {
-                    Thread.sleep(retryDelay * 1000L);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+                sleepWithInterruptCheck(retryDelay * 1000L);
             }
         }
 
         log.info("【{}】WebSocket 连接循环已退出", cookieId);
     }
 
+    /**
+     * 检查账号是否启用
+     */
+    private boolean isAccountEnabled() {
+        try {
+            Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
+            return cookieOpt.isPresent() && Boolean.TRUE.equals(cookieOpt.get().getEnabled());
+        } catch (Exception e) {
+            log.error("【{}】检查账号状态失败", cookieId, e);
+            return false;
+        }
+    }
 
     /**
-     * 创建WebSocket连接
+     * 等待WebSocket连接断开
+     */
+    private void waitForDisconnection() {
+        log.info("【{}】WebSocket连接已建立，等待连接断开...", cookieId);
+        while (connected.get() && running.get()) {
+            sleepWithInterruptCheck(1000);
+        }
+    }
+
+    /**
+     * 可中断的Sleep
+     */
+    private void sleepWithInterruptCheck(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            log.warn("【{}】Sleep被中断", cookieId);
+        }
+    }
+
+
+    /**
+     * 创建WebSocket连接 - 重构版本，纯粹的单次连接尝试
+     * 失败直接抛异常，由 connectionLoop() 统一处理重试
      */
     private void connectWebSocket() throws Exception {
+        log.info("【{}】开始建立WebSocket连接...", cookieId);
+
         // 配置WebSocket容器，设置缓冲区大小为10MB（解决1009错误：消息过大）
         WebSocketContainer container = ContainerProvider.getWebSocketContainer();
         container.setDefaultMaxTextMessageBufferSize(10 * 1024 * 1024); // 10MB
         container.setDefaultMaxBinaryMessageBufferSize(10 * 1024 * 1024); // 10MB
-        
+
         // 使用配置好的容器创建WebSocket客户端
         WebSocketClient client = new StandardWebSocketClient(container);
 
-        // 准备请求头 - 使用WebSocketHttpHeaders，添加所有必要的headers
-        WebSocketHttpHeaders headers = new WebSocketHttpHeaders();
+        // 准备请求头
+        WebSocketHttpHeaders headers = buildWebSocketHeaders();
 
+        try {
+            // 发起WebSocket握手
+            ListenableFuture<WebSocketSession> future =
+                    client.doHandshake(this, headers, URI.create(WEBSOCKET_URL));
+
+            // 等待连接完成（超时10秒）
+            this.webSocketSession = future.get(10, TimeUnit.SECONDS);
+            log.info("【{}】WebSocket连接建立成功", cookieId);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new Exception("WebSocket连接被中断", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new Exception("WebSocket连接执行失败: " + e.getMessage(), e);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new Exception("WebSocket连接超时", e);
+        }
+    }
+
+    /**
+     * 构建WebSocket请求头
+     */
+    private WebSocketHttpHeaders buildWebSocketHeaders() {
+        WebSocketHttpHeaders headers = new WebSocketHttpHeaders();
         headers.add("Accept-Encoding", "gzip, deflate, br, zstd");
         headers.add("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6");
         headers.add("Cache-Control", "no-cache");
@@ -437,24 +486,7 @@ public class XianyuClient extends TextWebSocketHandler {
         headers.add("sec-websocket-version", "13");
         headers.add("upgrade", "websocket");
         headers.add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0");
-
-        try {
-            // doHandshake参数: WebSocketHandler, WebSocketHttpHeaders, URI
-            ListenableFuture<WebSocketSession> future =
-                    client.doHandshake(this, headers, URI.create(WEBSOCKET_URL));
-
-            // 等待连接完成
-            this.webSocketSession = future.get(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new Exception("WebSocket连接被中断", e);
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new Exception("WebSocket连接执行失败: " + e.getMessage(), e);
-        } catch (java.util.concurrent.TimeoutException e) {
-            throw new Exception("WebSocket连接超时", e);
-        }
-
-        log.info("【{}】WebSocket连接建立成功", cookieId);
+        return headers;
     }
 
 
@@ -590,7 +622,7 @@ public class XianyuClient extends TextWebSocketHandler {
 
         JSONObject regHeaders = new JSONObject();
         regHeaders.put("cache-header", "app-key token ua wv");
-        regHeaders.put("app-key",WEBSOCKET_APP_KEY);
+        regHeaders.put("app-key", WEBSOCKET_APP_KEY);
         regHeaders.put("token", currentToken);
         regHeaders.put("ua", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0");
         regHeaders.put("dt", "j");
@@ -650,124 +682,109 @@ public class XianyuClient extends TextWebSocketHandler {
 
 
     /**
-     * 刷新Token - 对应Python的refresh_token()方法
-     * 添加自动降级机制：Token获取失败时自动刷新Cookie
+     * 刷新Token - 重构版本，去除嵌套循环
+     * 策略：尝试获取Token，失败则刷新Cookie后抛异常，由上层决定是否重试
      */
     private String refreshToken() {
-        int maxRetries = 3;
-        int retryCount = 0;
+        lastTokenRefreshStatus = "started";
+        log.info("【{}】开始刷新token...", cookieId);
 
-        while (retryCount < maxRetries) {
-            try {
-                if (retryCount > 0) {
-                    log.info("【{}】Token获取失败，第 {} 次重试...", cookieId, retryCount);
-                    // 添加重试延迟，避免过快重试导致资源竞争
-                    try {
-                        Thread.sleep(2000 * retryCount); // 指数退避：2s, 4s, 6s
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                } else {
-                    log.info("【{}】开始刷新token...", cookieId);
-                }
-                lastTokenRefreshStatus = "started";
-
-                // 检查是否在消息冷却期内
-                long currentTime = System.currentTimeMillis();
-                long timeSinceLastMessage = currentTime - lastMessageReceivedTime.get();
-                if (lastMessageReceivedTime.get() > 0 && timeSinceLastMessage < MESSAGE_COOLDOWN * 1000L) {
-                    long remainingTime = MESSAGE_COOLDOWN * 1000L - timeSinceLastMessage;
-                    log.info("【{}】收到消息后冷却中，放弃本次token刷新，还需等待 {} 秒",
-                            cookieId, remainingTime / 1000);
-                    lastTokenRefreshStatus = "skipped_cooldown";
-                    return null;
-                }
-
-                // 从数据库重新加载Cookie（可能已被浏览器刷新更新）
-                try {
-                    Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
-                    if (cookieOpt.isPresent()) {
-                        String newCookiesStr = cookieOpt.get().getValue();
-                        if (!newCookiesStr.equals(this.cookiesStr)) {
-                            log.info("【{}】检测到数据库中的cookie已更新，重新加载cookie", cookieId);
-                            this.cookiesStr = newCookiesStr;
-                            this.cookies = parseCookies(this.cookiesStr);
-                            log.warn("【{}】Cookie已从数据库重新加载", cookieId);
-                        }
-                    }
-                } catch (Exception e) {
-                    log.warn("【{}】从数据库重新加载cookie失败，继续使用当前cookie: {}", cookieId, e.getMessage());
-                }
-
-                // 尝试获取Token
-                log.debug("【{}】🤖准备调用官方API获取Token...", cookieId);
-                String token = attemptGetToken();
-                log.debug("【{}】🤖准备调用官方API获取Token为: {}", cookieId, token);
-
-                if (token != null) {
-                    // Token获取成功
-                    this.currentToken = token;
-                    this.lastTokenRefreshTime.set(System.currentTimeMillis());
-                    this.lastMessageReceivedTime.set(0); // 重置消息接收时间
-                    log.warn("【{}】✅ Token刷新成功", cookieId);
-                    lastTokenRefreshStatus = "success";
-                    return token;
-                }
-
-                // Token获取失败，尝试刷新Cookie
-                log.warn("【{}】⚠️ Token获取失败，尝试通过浏览器刷新Cookie...", cookieId);
-
-                try {
-                    Map<String, String> newCookies = browserService.refreshCookies(cookieId);
-
-                    if (newCookies != null && !newCookies.isEmpty()) {
-                        log.info("【{}】✅ Cookie刷新成功，重新加载...",  cookieId);
-                        // 重新加载Cookie
-                        loadCookies();
-                        retryCount++;
-                        // 继续下一轮重试
-                        continue;
-                    } else {
-                        log.error("【{}】❌ Cookie刷新失败，尝试强制重建持久化上下文", cookieId);
-                        // 强制关闭持久化上下文，下次重试时会重新创建
-                        try {
-                            browserService.closePersistentContext(cookieId);
-                            Thread.sleep(3000); // 等待3秒确保资源完全释放
-                            
-                            // 再次尝试刷新Cookie
-                            newCookies = browserService.refreshCookies(cookieId);
-                            if (newCookies != null && !newCookies.isEmpty()) {
-                                log.info("【{}】重建上下文后Cookie刷新成功", cookieId);
-                                loadCookies();
-                                retryCount++;
-                                continue;
-                            }
-                        } catch (Exception retryEx) {
-                            log.error("【{}】重建上下文后仍然失败: {}", cookieId, retryEx.getMessage());
-                        }
-                        
-                        log.error("【{}】❌ Cookie刷新最终失败，无法继续", cookieId);
-                        break;
-                    }
-                } catch (Exception e) {
-                    log.error("【{}】❌ Cookie刷新异常: {}", cookieId, e.getMessage());
-                    // 异常时也尝试关闭上下文
-                    try {
-                        browserService.closePersistentContext(cookieId);
-                    } catch (Exception ignored) {
-                    }
-                    break;
-                }
-                
-            } catch (Exception e) {
-                log.error("【{}】Token刷新过程异常", cookieId, e);
-                break;
-            }
+        // 检查是否在消息冷却期内
+        long currentTime = System.currentTimeMillis();
+        long timeSinceLastMessage = currentTime - lastMessageReceivedTime.get();
+        if (lastMessageReceivedTime.get() > 0 && timeSinceLastMessage < MESSAGE_COOLDOWN * 1000L) {
+            long remainingTime = MESSAGE_COOLDOWN * 1000L - timeSinceLastMessage;
+            log.info("【{}】收到消息后冷却中，放弃本次token刷新，还需等待 {} 秒",
+                    cookieId, remainingTime / 1000);
+            lastTokenRefreshStatus = "skipped_cooldown";
+            return null;
         }
 
-        log.error("【{}】❌ Token刷新最终失败，已重试 {} 次", cookieId, retryCount);
-        lastTokenRefreshStatus = "failed";
-        return null;
+        // 从数据库重新加载Cookie（可能已被浏览器刷新更新）
+        reloadCookieFromDatabase();
+
+        // 尝试获取Token
+        log.debug("【{}】🤖准备调用官方API获取Token...", cookieId);
+        String token = attemptGetToken();
+        log.debug("【{}】🤖调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
+
+        if (token != null) {
+            // Token获取成功
+            this.currentToken = token;
+            this.lastTokenRefreshTime.set(System.currentTimeMillis());
+            this.lastMessageReceivedTime.set(0);
+            log.warn("【{}】✅ Token刷新成功", cookieId);
+            lastTokenRefreshStatus = "success";
+            return token;
+        }
+
+        // Token获取失败，尝试刷新Cookie然后返回null
+        // 不在这里重试，失败后让connectionLoop处理重连
+        log.warn("【{}】⚠️ Token获取失败，尝试通过浏览器刷新Cookie...", cookieId);
+        refreshCookieViaBrowser();
+
+        // 尝试获取Token
+        log.debug("【{}】🤖刷新Cookie后调用官方API获取Token...", cookieId);
+        token = attemptGetToken();
+        log.debug("【{}】🤖刷新Cookie后调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
+        return token;
+    }
+
+    /**
+     * 从数据库重新加载Cookie（避免重复代码）
+     */
+    private void reloadCookieFromDatabase() {
+        try {
+            Optional<Cookie> cookieOpt = cookieRepository.findById(cookieId);
+            if (cookieOpt.isPresent()) {
+                String newCookiesStr = cookieOpt.get().getValue();
+                if (!newCookiesStr.equals(this.cookiesStr)) {
+                    log.info("【{}】检测到数据库中的cookie已更新，重新加载cookie", cookieId);
+                    this.cookiesStr = newCookiesStr;
+                    this.cookies = parseCookies(this.cookiesStr);
+                    log.warn("【{}】Cookie已从数据库重新加载", cookieId);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("【{}】从数据库重新加载cookie失败，继续使用当前cookie: {}", cookieId, e.getMessage());
+        }
+    }
+
+    /**
+     * 通过浏览器刷新Cookie（避免重复代码）
+     */
+    private void refreshCookieViaBrowser() {
+        try {
+            Map<String, String> newCookies = browserService.refreshCookies(cookieId);
+
+            if (newCookies != null && !newCookies.isEmpty()) {
+                log.info("【{}】✅ Cookie刷新成功，重新加载...", cookieId);
+                loadCookies();
+                return;
+            }
+
+            // 首次失败，尝试重建上下文
+            log.warn("【{}】Cookie刷新失败，尝试强制重建持久化上下文", cookieId);
+            browserService.closePersistentContext(cookieId);
+            Thread.sleep(3000); // 等待资源释放
+
+            // 再次尝试
+            newCookies = browserService.refreshCookies(cookieId);
+            if (newCookies != null && !newCookies.isEmpty()) {
+                log.info("【{}】重建上下文后Cookie刷新成功", cookieId);
+                loadCookies();
+            } else {
+                log.error("【{}】❌ Cookie刷新最终失败", cookieId);
+            }
+            lastTokenRefreshStatus = "success";
+        } catch (Exception e) {
+            log.error("【{}】❌ Cookie刷新异常: {}", cookieId, e.getMessage());
+            try {
+                browserService.closePersistentContext(cookieId);
+            } catch (Exception ignored) {
+            }
+            lastTokenRefreshStatus = "failed";
+        }
     }
 
     /**
@@ -811,9 +828,10 @@ public class XianyuClient extends TextWebSocketHandler {
             log.info("【{}】API端点: {}", cookieId, url);
             log.info("【{}】timestamp: {}", cookieId, timestamp);
             log.info("【{}】sign: {}", cookieId, sign);
+            log.info("【{}】cookies: {}", cookieId, cookiesStr);
 
             // 发送POST请求
-            HttpRequest request = cn.hutool.http.HttpRequest.post(url);
+            HttpRequest request = HttpRequest.post(url);
             request.form("data", dataVal);
             params.forEach((k, v) -> request.form(k, v.toString()));
             request.header("cookie", cookiesStr);
@@ -848,7 +866,7 @@ public class XianyuClient extends TextWebSocketHandler {
                             JSONObject data = resJson.getJSONObject("data");
                             if (data.containsKey("accessToken")) {
                                 String newToken = data.getString("accessToken");
-                                log.info("【{}】获取到accessToken", cookieId);
+                                log.info("【{}】获取到accessToken: {}", cookieId, newToken);
                                 return newToken;
                             }
                         }
@@ -1069,7 +1087,7 @@ public class XianyuClient extends TextWebSocketHandler {
             } finally {
                 activeMessageTasks.decrementAndGet();
                 messageSemaphore.release();
-                
+
                 // 定期记录活跃任务数（每100个任务记录一次）
                 // 对应Python: if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0
                 if (currentTasks % 100 == 0 && currentTasks > 0) {
@@ -1149,7 +1167,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 判断是否为系统消息
      * 对应Python的系统消息过滤逻辑 (Line 7626-7662)
-     * 
+     *
      * @param sendMessage 消息内容
      * @return true=系统消息（需要过滤），false=正常消息
      */
@@ -1157,7 +1175,7 @@ public class XianyuClient extends TextWebSocketHandler {
         if (sendMessage == null) {
             return false;
         }
-        
+
         // 15+种系统消息类型
         return "[我已拍下，待付款]".equals(sendMessage)
                 || "[你关闭了订单，钱款已原路退返]".equals(sendMessage)
@@ -1177,7 +1195,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 判断是否为自动发货触发消息
      * 对应Python的_is_auto_delivery_trigger()方法 (Line 981-997)
-     * 
+     *
      * @param sendMessage 消息内容
      * @return true=自动发货触发消息
      */
@@ -1197,7 +1215,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 提取卡片消息的标题
      * 对应Python的卡片消息解析逻辑 (Line 7673-7692)
-     * 
+     *
      * @param message 消息对象
      * @return 卡片标题，解析失败返回null
      */
@@ -1208,26 +1226,26 @@ public class XianyuClient extends TextWebSocketHandler {
             if (!message.containsKey("1") || !(message.get("1") instanceof JSONObject)) {
                 return null;
             }
-            
+
             JSONObject message1 = message.getJSONObject("1");
             if (!message1.containsKey("6") || !(message1.get("6") instanceof JSONObject)) {
                 return null;
             }
-            
+
             JSONObject message6 = message1.getJSONObject("6");
             if (!message6.containsKey("3") || !(message6.get("3") instanceof JSONObject)) {
                 return null;
             }
-            
+
             JSONObject message63 = message6.getJSONObject("3");
             if (!message63.containsKey("5")) {
                 return null;
             }
-            
+
             // 解析JSON内容
             String cardContentStr = message63.getString("5");
             JSONObject cardContent = JSON.parseObject(cardContentStr);
-            
+
             if (cardContent.containsKey("dxCard")) {
                 JSONObject dxCard = cardContent.getJSONObject("dxCard");
                 if (dxCard.containsKey("item")) {
@@ -1241,9 +1259,9 @@ public class XianyuClient extends TextWebSocketHandler {
                     }
                 }
             }
-            
+
             return null;
-            
+
         } catch (Exception e) {
             log.debug("【{}】解析卡片消息失败: {}", cookieId, e.getMessage());
             return null;
@@ -2480,7 +2498,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 处理消息主逻辑 - 完整版（阶段1：基础消息处理）
      * 对应Python的handle_message()方法
-     * 
+     * <p>
      * 阶段1包含：
      * 1. 检查账号状态
      * 2. 发送ACK确认
@@ -2538,7 +2556,7 @@ public class XianyuClient extends TextWebSocketHandler {
             String orderId = extractOrderId(message);
             if (orderId != null) {
                 String msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                    .format(new java.util.Date());
+                        .format(new java.util.Date());
                 log.info("[{}] 【{}】✅ 检测到订单ID: {}，开始获取订单详情", msgTime, cookieId, orderId);
 
                 // 提取用户ID和商品ID用于订单详情获取
@@ -2563,7 +2581,7 @@ public class XianyuClient extends TextWebSocketHandler {
             try {
                 log.info("【{}】🔍 完整消息结构: {}", cookieId, message.toJSONString());
                 String msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                    .format(new java.util.Date());
+                        .format(new java.util.Date());
 
                 // 安全地检查订单状态（红色提醒）
                 String redReminder = null;
@@ -2607,7 +2625,7 @@ public class XianyuClient extends TextWebSocketHandler {
             String chatId;
             long createTime;
             String itemId;
-            
+
             try {
                 // 安全地提取聊天消息信息
                 if (!message.containsKey("1") || !(message.get("1") instanceof JSONObject)) {
@@ -2623,7 +2641,7 @@ public class XianyuClient extends TextWebSocketHandler {
 
                 // 提取消息时间
                 createTime = message1.getLongValue("5");
-                
+
                 // 提取消息详情
                 JSONObject message10 = message1.getJSONObject("10");
                 sendUserName = message10.getString("senderNick");
@@ -2659,23 +2677,23 @@ public class XianyuClient extends TextWebSocketHandler {
 
             // 格式化消息时间
             String msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                .format(new java.util.Date(createTime));
+                    .format(new java.util.Date(createTime));
 
             // ========== 步骤9: 判断消息方向 ==========
             // 对应Python: Line 7561-7568
             if (sendUserId.equals(myId)) {
                 log.info("[{}] 【手动发出】 商品({}): {}", msgTime, itemId, sendMessage);
-                
+
                 // 暂停该chat_id的自动回复10分钟
                 pauseManager.pauseChat(chatId, cookieId);
-                
+
                 return;
             }
-            
+
             // ========== 步骤10: 消息通知 ==========
             // 对应Python: Line 7569-7582
-            log.info("[{}] 【收到】用户: {} (ID: {}), 商品({}): {}", 
-                msgTime, sendUserName, sendUserId, itemId, sendMessage);
+            log.info("[{}] 【收到】用户: {} (ID: {}), 商品({}): {}",
+                    msgTime, sendUserName, sendUserId, itemId, sendMessage);
 
             // 🔔 立即发送消息通知（独立于自动回复功能）
             // 检查是否为群组消息，如果是群组消息则跳过通知
@@ -2686,7 +2704,7 @@ public class XianyuClient extends TextWebSocketHandler {
                 if (sessionType == null) {
                     sessionType = "1"; // 默认为个人消息类型
                 }
-                
+
                 if ("30".equals(sessionType)) {
                     log.info("📱 检测到群组消息（sessionType=30），跳过消息通知");
                 } else {
@@ -2697,7 +2715,7 @@ public class XianyuClient extends TextWebSocketHandler {
                     final String finalSendMessage = sendMessage;
                     final String finalItemId = itemId;
                     final String finalChatId = chatId;
-                    
+
                     CompletableFuture.runAsync(() -> {
                         try {
                             // 发送消息通知(简化版 - 实际应调用NotificationService)
@@ -2717,7 +2735,7 @@ public class XianyuClient extends TextWebSocketHandler {
                 try {
                     //处理系统消息的订单状态更新
                     orderStatusHandler.handleSystemMessage(message, sendMessage, cookieId, msgTime);
-                    
+
                     // 处理红色提醒消息
                     if (message.containsKey("3") && message.get("3") instanceof JSONObject) {
                         JSONObject message3 = message.getJSONObject("3");
@@ -2731,8 +2749,8 @@ public class XianyuClient extends TextWebSocketHandler {
                     log.error("【{}】订单状态处理失败: {}", cookieId, e.getMessage());
                 }
             }
-            
-            
+
+
             // ========== 步骤12: 系统消息过滤 ==========
             // 对应Python: Line 7626-7662
             // 检查并过滤15+种系统消息
@@ -2744,16 +2762,16 @@ public class XianyuClient extends TextWebSocketHandler {
             // ========== 步骤13: 自动发货触发检查 ==========
             // 对应Python: Line 7664-7669
             if (isAutoDeliveryTrigger(sendMessage)) {
-                log.info("[{}] 【{}】检测到自动发货触发消息，即使在暂停期间也继续处理: {}", 
-                    msgTime, cookieId, sendMessage);
-                
+                log.info("[{}] 【{}】检测到自动发货触发消息，即使在暂停期间也继续处理: {}",
+                        msgTime, cookieId, sendMessage);
+
                 // 异步处理自动发货
                 final String finalSendUserName = sendUserName;
                 final String finalSendUserId = sendUserId;
                 final String finalItemId = itemId;
                 final String finalChatId = chatId;
                 final String finalMsgTime = msgTime;
-                
+
                 CompletableFuture.runAsync(() -> {
                     try {
                         // 调用统一的自动发货处理方法（已在本类中实现）
@@ -2763,7 +2781,7 @@ public class XianyuClient extends TextWebSocketHandler {
                         log.error("【{}】自动发货处理失败", cookieId, e);
                     }
                 }, scheduledExecutor);
-                
+
                 return;
             }
 
@@ -2771,27 +2789,27 @@ public class XianyuClient extends TextWebSocketHandler {
             // 对应Python: Line 7670-7749
             if ("[卡片消息]".equals(sendMessage)) {
                 String cardTitle = extractCardTitle(message);
-                
+
                 if ("我已小刀，待刀成".equals(cardTitle)) {
-                    log.info("[{}] 【{}】【系统】检测到\"我已小刀，待刀成\"，即使在暂停期间也继续处理", 
-                        msgTime, cookieId);
-                    
+                    log.info("[{}] 【{}】【系统】检测到\"我已小刀，待刀成\"，即使在暂停期间也继续处理",
+                            msgTime, cookieId);
+
                     // 检查商品是否属于当前cookies
                     if (itemId != null && !itemId.startsWith("auto_")) {
                         // 商品归属验证（简化版 - 实际应查询数据库）
                         log.warn("[{}] 【{}】✅ 商品 {} 归属验证通过", msgTime, cookieId, itemId);
                     }
-                    
+
                     // 提取订单ID（使用已在2538行定义的orderId变量）
                     orderId = extractOrderId(message);
                     if (orderId == null) {
                         log.warn("[{}] 【{}】❌ 未能提取到订单ID，无法执行免拼发货", msgTime, cookieId);
                         return;
                     }
-                    
+
                     // 标记为小刀订单（简化版 - 实际应更新数据库）
                     log.info("[{}] 【{}】✅ 订单 {} 已标记为小刀订单", msgTime, cookieId, orderId);
-                    
+
                     // 异步执行免拼发货
                     final String finalOrderId = orderId;
                     final String finalItemId = itemId;
@@ -2799,27 +2817,27 @@ public class XianyuClient extends TextWebSocketHandler {
                     final String finalSendUserName = sendUserName;
                     final String finalChatId = chatId;
                     final String finalMsgTime = msgTime;
-                    
+
                     CompletableFuture.runAsync(() -> {
                         try {
                             // 延迟2秒
                             Thread.sleep(2000);
-                            
+
                             // 调用自动免拼发货方法（简化版 - 实际应调用API）
                             log.info("[{}] 【{}】延迟2秒后执行免拼发货（autoFreeShipping已调用）", finalMsgTime, cookieId);
-                            
+
                             // 然后执行自动发货（handleAutoDelivery方法已存在）
                             log.info("[{}] 【{}】免拼发货后继续自动发货流程", finalMsgTime, cookieId);
-                            
+
                         } catch (Exception e) {
                             log.error("【{}】处理免拼小刀异常", cookieId, e);
                         }
                     }, scheduledExecutor);
-                    
+
                     return;
                 } else {
-                    log.info("[{}] 【{}】收到卡片消息，标题: {}", msgTime, cookieId, 
-                        cardTitle != null ? cardTitle : "未知");
+                    log.info("[{}] 【{}】收到卡片消息，标题: {}", msgTime, cookieId,
+                            cardTitle != null ? cardTitle : "未知");
                     // 不是目标卡片消息，继续正常处理流程
                 }
             }
@@ -2834,7 +2852,7 @@ public class XianyuClient extends TextWebSocketHandler {
             final String finalItemId = itemId;
             final String finalChatId = chatId;
             final String finalMsgTime = msgTime;
-            
+
             CompletableFuture.runAsync(() -> {
                 try {
                     // 防抖回复逻辑（简化版 - 实际需实现消息去重和防抖计时器）
@@ -2843,15 +2861,15 @@ public class XianyuClient extends TextWebSocketHandler {
                     // 2. 管理防抖任务Map
                     // 3. 取消旧任务并调度新任务
                     // 4. 延迟后调用processChatMessageReply
-                    
-                    log.info("【{}】防抖回复调度已启动: chatId={}, 用户={}, 消息={}", 
-                        cookieId, finalChatId, finalSendUserName, finalSendMessage);
-                        
+
+                    log.info("【{}】防抖回复调度已启动: chatId={}, 用户={}, 消息={}",
+                            cookieId, finalChatId, finalSendUserName, finalSendMessage);
+
                 } catch (Exception e) {
                     log.error("【{}】防抖回复调度失败", cookieId, e);
                 }
             }, scheduledExecutor);
-            
+
             log.debug("【{}】消息处理完成（阶段3 - 全部15个步骤）", cookieId);
 
         } catch (Exception e) {
@@ -2862,7 +2880,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 解密消息内容
      * 对应Python的消息解密逻辑 (Line 7336-7391)
-     * 
+     *
      * @param messageData 原始消息数据
      * @return 解密后的消息对象，失败返回null
      */
@@ -2870,9 +2888,9 @@ public class XianyuClient extends TextWebSocketHandler {
         try {
             // 获取同步数据
             JSONObject syncData = messageData.getJSONObject("body")
-                .getJSONObject("syncPushPackage")
-                .getJSONArray("data")
-                .getJSONObject(0);
+                    .getJSONObject("syncPushPackage")
+                    .getJSONArray("data")
+                    .getJSONObject(0);
 
             // 检查是否有必要的字段
             if (!syncData.containsKey("data")) {
@@ -2881,29 +2899,29 @@ public class XianyuClient extends TextWebSocketHandler {
             }
 
             String data = syncData.getString("data");
-            
+
             // 尝试Base64解码 + JSON解析（对应Python的第一次尝试）
             try {
                 byte[] decodedBytes = java.util.Base64.getDecoder().decode(data);
                 String decodedStr = new String(decodedBytes, "UTF-8");
                 JSONObject parsedData = JSON.parseObject(decodedStr);
-                
+
                 // 检查是否为系统消息（对应Python Line 7354-7366）
                 if (parsedData.containsKey("chatType")) {
                     if (parsedData.containsKey("operation")) {
                         JSONObject operation = parsedData.getJSONObject("operation");
                         if (operation.containsKey("content")) {
                             JSONObject content = operation.getJSONObject("content");
-                            
+
                             // 处理系统引导消息
                             if (content.containsKey("sessionArouse")) {
                                 String msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                                    .format(new java.util.Date());
+                                        .format(new java.util.Date());
                                 log.info("[{}] 【{}】【系统】小闲鱼智能提示（已跳过）", msgTime, cookieId);
                                 return null;
                             } else if (content.containsKey("contentType")) {
                                 String msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                                    .format(new java.util.Date());
+                                        .format(new java.util.Date());
                                 log.warn("[{}] 【{}】【系统】其他类型消息（已跳过）", msgTime, cookieId);
                                 return null;
                             }
@@ -2911,10 +2929,10 @@ public class XianyuClient extends TextWebSocketHandler {
                     }
                     return null;
                 }
-                
+
                 // 如果不是系统消息，返回解析的数据
                 return parsedData;
-                
+
             } catch (Exception e) {
                 // Base64解析失败，尝试解密（对应Python Line 7372-7373）
                 try {
@@ -2925,7 +2943,7 @@ public class XianyuClient extends TextWebSocketHandler {
                     return null;
                 }
             }
-            
+
         } catch (Exception e) {
             log.error("【{}】解密消息过程异常: {}", cookieId, e.getMessage());
             return null;
@@ -2948,8 +2966,8 @@ public class XianyuClient extends TextWebSocketHandler {
                 JSONObject message1Obj = (JSONObject) message1;
                 if (message1Obj.containsKey("10") && message1Obj.get("10") instanceof JSONObject) {
                     JSONObject message10 = message1Obj.getJSONObject("10");
-                    return message10.getString("senderUserId") != null ? 
-                        message10.getString("senderUserId") : "unknown_user";
+                    return message10.getString("senderUserId") != null ?
+                            message10.getString("senderUserId") : "unknown_user";
                 }
             }
         } catch (Exception e) {
@@ -2959,7 +2977,7 @@ public class XianyuClient extends TextWebSocketHandler {
     }
 
     /**
-     * 提取商品ID  
+     * 提取商品ID
      * 对应Python: Line 7436-7445
      */
     private String extractItemId(JSONObject message) {
@@ -2974,18 +2992,18 @@ public class XianyuClient extends TextWebSocketHandler {
                     }
                 }
             }
-            
+
             // 如果没有提取到，调用辅助方法 extractItemIdFromMessage
             // 对应Python: self.extract_item_id_from_message(message) (Line 3010-3084)
             String extractedItemId = extractItemIdFromMessage(message);
             if (extractedItemId != null) {
                 return extractedItemId;
             }
-            
+
         } catch (Exception e) {
             log.debug("【{}】提取商品ID失败: {}", cookieId, e.getMessage());
         }
-        
+
         // 使用默认值
         String userId = extractUserId(message);
         return "auto_" + userId + "_" + System.currentTimeMillis();
@@ -2994,7 +3012,7 @@ public class XianyuClient extends TextWebSocketHandler {
     /**
      * 从消息中提取商品ID的辅助方法
      * 对应Python: extract_item_id_from_message (Line 3010-3084)
-     * 
+     *
      * @param message 消息对象
      * @return 商品ID，提取失败返回null
      */
@@ -3015,7 +3033,7 @@ public class XianyuClient extends TextWebSocketHandler {
             // 方法2: 从message["3"]中提取
             if (message.containsKey("3") && message.get("3") instanceof JSONObject) {
                 JSONObject message3 = message.getJSONObject("3");
-                
+
                 // 从extension中提取
                 if (message3.containsKey("extension") && message3.get("extension") instanceof JSONObject) {
                     JSONObject extension = message3.getJSONObject("extension");
@@ -3028,7 +3046,7 @@ public class XianyuClient extends TextWebSocketHandler {
                         return itemId;
                     }
                 }
-                
+
                 // 从bizData中提取
                 if (message3.containsKey("bizData") && message3.get("bizData") instanceof JSONObject) {
                     JSONObject bizData = message3.getJSONObject("bizData");
@@ -3041,7 +3059,7 @@ public class XianyuClient extends TextWebSocketHandler {
                         return itemId;
                     }
                 }
-                
+
                 // 从其他可能的字段中提取
                 for (Map.Entry<String, Object> entry : message3.entrySet()) {
                     if (entry.getValue() instanceof JSONObject) {
@@ -3056,7 +3074,7 @@ public class XianyuClient extends TextWebSocketHandler {
                         }
                     }
                 }
-                
+
                 // 从消息内容中提取数字ID
                 String content = message3.getString("content");
                 if (content != null && !content.isEmpty()) {
@@ -3068,15 +3086,15 @@ public class XianyuClient extends TextWebSocketHandler {
                     }
                 }
             }
-            
+
             // 方法3: 遍历整个消息结构查找可能的商品ID
             String foundItemId = findItemIdRecursive(message, "");
             if (foundItemId != null) {
                 return foundItemId;
             }
-            
+
             return null;
-            
+
         } catch (Exception e) {
             log.debug("【{}】提取商品ID辅助方法失败: {}", cookieId, e.getMessage());
             return null;
@@ -3090,7 +3108,7 @@ public class XianyuClient extends TextWebSocketHandler {
     private String findItemIdRecursive(Object obj, String path) {
         if (obj instanceof JSONObject) {
             JSONObject jsonObj = (JSONObject) obj;
-            
+
             // 直接查找itemId字段
             for (String key : new String[]{"itemId", "item_id", "id"}) {
                 if (jsonObj.containsKey(key)) {
@@ -3104,7 +3122,7 @@ public class XianyuClient extends TextWebSocketHandler {
                     }
                 }
             }
-            
+
             // 递归查找子对象
             for (Map.Entry<String, Object> entry : jsonObj.entrySet()) {
                 String newPath = path.isEmpty() ? entry.getKey() : path + "." + entry.getKey();
@@ -3114,7 +3132,7 @@ public class XianyuClient extends TextWebSocketHandler {
                 }
             }
         }
-        
+
         return null;
     }
 
