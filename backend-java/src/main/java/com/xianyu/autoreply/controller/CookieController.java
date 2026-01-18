@@ -8,15 +8,21 @@ import com.xianyu.autoreply.service.TokenService;
 import com.xianyu.autoreply.service.XianyuClientService;
 import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 @RestController
@@ -85,6 +91,9 @@ public class CookieController {
             response.setAutoConfirm(cookie.getAutoConfirm());
             response.setRemark(cookie.getRemark() != null ? cookie.getRemark() : "");
             response.setPauseDuration(cookie.getPauseDuration() != null ? cookie.getPauseDuration() : 10);
+            response.setUsername(cookie.getUsername());
+            response.setLoginPassword(cookie.getPassword());
+            response.setShowBrowser(cookie.getShowBrowser() == 1);
             return response;
         }).collect(Collectors.toList());
     }
@@ -291,5 +300,10 @@ public class CookieController {
         private String remark;
         @JsonProperty("pause_duration")
         private Integer pauseDuration;
+        private String username;
+        @JsonProperty("login_password")
+        private String loginPassword;
+        @JsonProperty("show_browser")
+        private Boolean showBrowser;
     }
 }

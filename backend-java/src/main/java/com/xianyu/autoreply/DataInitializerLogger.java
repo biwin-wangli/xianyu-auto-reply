@@ -37,7 +37,7 @@ public class DataInitializerLogger implements ApplicationRunner {
 
         if (Objects.isNull(systemSetting)) {
             // 如果没有初始化过，则执行data.sql中的脚本
-            Resource resource = resourceLoader.getResource("classpath:data.sql");
+            Resource resource = resourceLoader.getResource("classpath:init.sql");
             try (InputStream inputStream = resource.getInputStream()) {
                 String sqlScript = StreamUtils.copyToString(inputStream, StandardCharsets.UTF_8);
                 // Split the SQL script into individual statements and execute them
@@ -53,7 +53,7 @@ public class DataInitializerLogger implements ApplicationRunner {
             }
 
             // 在这里定义您的自定义日志内容
-            logger.info("数据库首次初始化完成，默认数据已通过 data.sql 文件成功插入。");
+            logger.info("数据库首次初始化完成，默认数据已通过 init.sql 文件成功插入。");
 
             // 插入初始化标志，防止下次启动时再次执行
             jdbcTemplate.update("UPDATE system_settings SET value = ? WHERE `key` = ?", "true", "init_system");

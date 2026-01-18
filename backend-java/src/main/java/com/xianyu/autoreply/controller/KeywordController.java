@@ -1,25 +1,36 @@
 package com.xianyu.autoreply.controller;
 
-import com.xianyu.autoreply.dto.KeywordWithItemIdRequest;
 import com.xianyu.autoreply.entity.AiReplySetting;
 import com.xianyu.autoreply.entity.Cookie;
 import com.xianyu.autoreply.entity.DefaultReply;
 import com.xianyu.autoreply.entity.Keyword;
+import com.xianyu.autoreply.model.req.KeywordWithItemIdRequest;
 import com.xianyu.autoreply.repository.AiReplySettingRepository;
 import com.xianyu.autoreply.repository.CookieRepository;
+import com.xianyu.autoreply.repository.DefaultReplyRecordRepository;
 import com.xianyu.autoreply.repository.DefaultReplyRepository;
 import com.xianyu.autoreply.repository.KeywordRepository;
 import com.xianyu.autoreply.service.AiReplyService;
 import com.xianyu.autoreply.service.TokenService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.*;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-import java.util.HashSet;
-import java.util.ArrayList;
 import java.util.stream.Collectors;
 
 @RestController
@@ -28,6 +39,7 @@ public class KeywordController {
 
     private final KeywordRepository keywordRepository;
     private final DefaultReplyRepository defaultReplyRepository;
+    private final DefaultReplyRecordRepository defaultReplyRecordRepository;
     private final AiReplySettingRepository aiReplySettingRepository;
     private final CookieRepository cookieRepository;
     private final AiReplyService aiReplyService;
@@ -36,12 +48,14 @@ public class KeywordController {
     @Autowired
     public KeywordController(KeywordRepository keywordRepository,
                              DefaultReplyRepository defaultReplyRepository,
+                             DefaultReplyRecordRepository defaultReplyRecordRepository,
                              AiReplySettingRepository aiReplySettingRepository,
                              CookieRepository cookieRepository,
                              AiReplyService aiReplyService,
                              TokenService tokenService) {
         this.keywordRepository = keywordRepository;
         this.defaultReplyRepository = defaultReplyRepository;
+        this.defaultReplyRecordRepository = defaultReplyRecordRepository;
         this.aiReplySettingRepository = aiReplySettingRepository;
         this.cookieRepository = cookieRepository;
         this.aiReplyService = aiReplyService;
@@ -52,36 +66,55 @@ public class KeywordController {
 
     // 对应 Python: @app.get('/keywords-with-item-id/{cid}')
     @GetMapping("/keywords-with-item-id/{cid}")
-    public List<Keyword> getKeywordsWithItemId(@PathVariable String cid, @RequestHeader(value = "Authorization", required = false) String token) {
-        // Validate user ownership
+    public List<Map<String, Object>> getKeywordsWithItemId(@PathVariable String cid, @RequestHeader(value = "Authorization", required = false) String token) {
         if (token != null) {
             String rawToken = token.replace("Bearer ", "");
             TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
+            // Validate user ownership
             if (tokenInfo != null) {
                 Long userId = tokenInfo.userId;
                 Cookie cookie = cookieRepository.findById(cid).orElse(null);
-                if (cookie != null && !cookie.getUserId().equals(userId)) {
-                    throw new RuntimeException("无权限访问该Cookie");
+                if (!Objects.equals(userId, 1L)) {
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限访问该Cookie");
+                    }
                 }
             }
         }
-        return keywordRepository.findByCookieId(cid);
+
+        // 获取关键词列表
+        List<Keyword> keywords = keywordRepository.findByCookieId(cid);
+
+        // 转换为前端需要的格式（与 Python 实现一致）
+        return keywords.stream()
+                .map(k -> {
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("keyword", k.getKeyword());
+                    result.put("reply", k.getReply() != null ? k.getReply() : "");
+                    result.put("item_id", k.getItemId() != null ? k.getItemId() : "");
+                    result.put("type", k.getType() != null ? k.getType() : "text");
+                    result.put("image_url", k.getImageUrl());
+                    return result;
+                })
+                .collect(Collectors.toList());
     }
-    
+
     // 对应 Python: @app.post('/keywords-with-item-id/{cid}')
     @PostMapping("/keywords-with-item-id/{cid}")
-    public Map<String, Object> updateKeywordsWithItemId(@PathVariable String cid, 
-                                                                  @RequestBody KeywordWithItemIdRequest request,
-                                                                  @RequestHeader(value = "Authorization", required = false) String token) {
+    public Map<String, Object> updateKeywordsWithItemId(@PathVariable String cid,
+                                                        @RequestBody KeywordWithItemIdRequest request,
+                                                        @RequestHeader(value = "Authorization", required = false) String token) {
         // Validate user ownership
         if (token != null) {
             String rawToken = token.replace("Bearer ", "");
             TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
             if (tokenInfo != null) {
                 Long userId = tokenInfo.userId;
-                Cookie cookie = cookieRepository.findById(cid).orElse(null);
-                if (cookie != null && !cookie.getUserId().equals(userId)) {
-                    throw new RuntimeException("无权限操作该Cookie");
+                if (!Objects.equals(userId, 1L)) {
+                    Cookie cookie = cookieRepository.findById(cid).orElse(null);
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限操作该Cookie");
+                    }
                 }
             }
         }
@@ -95,7 +128,7 @@ public class KeywordController {
                 throw new RuntimeException("关键词不能为空");
             }
             keywordStr = keywordStr.trim();
-            
+
             String reply = (String) kwData.getOrDefault("reply", "");
             String itemId = (String) kwData.getOrDefault("item_id", "");
             if (itemId != null && itemId.trim().isEmpty()) itemId = null; // Normalize empty to null
@@ -107,7 +140,7 @@ public class KeywordController {
                 throw new RuntimeException("关键词 '" + keywordStr + "' " + itemText + " 在当前提交中重复");
             }
             keywordSet.add(key);
-            
+
             // Check conflict with image keywords in DB
             if (itemId != null) {
                 if (!keywordRepository.findConflictImageKeywords(cid, keywordStr, itemId).isEmpty()) {
@@ -115,10 +148,10 @@ public class KeywordController {
                 }
             } else {
                 if (!keywordRepository.findConflictGenericImageKeywords(cid, keywordStr).isEmpty()) {
-                     throw new RuntimeException("关键词 '" + keywordStr + "' （通用关键词） 已存在（图片关键词），无法保存为文本关键词");
+                    throw new RuntimeException("关键词 '" + keywordStr + "' （通用关键词） 已存在（图片关键词），无法保存为文本关键词");
                 }
             }
-            
+
             Keyword k = new Keyword();
             k.setCookieId(cid);
             k.setKeyword(keywordStr);
@@ -127,13 +160,13 @@ public class KeywordController {
             k.setType("text");
             keywordsToSave.add(k);
         }
-        
+
         // Transactional update
         updateKeywordsTransactional(cid, keywordsToSave);
-        
+
         return Map.of("msg", "updated", "count", keywordsToSave.size());
     }
-    
+
     @Transactional
     protected void updateKeywordsTransactional(String cid, List<Keyword> newKeywords) {
         keywordRepository.deleteTextKeywordsByCookieId(cid);
@@ -145,14 +178,14 @@ public class KeywordController {
     public List<Keyword> getKeywords(@PathVariable String cid) {
         return keywordRepository.findByCookieId(cid);
     }
-    
+
     // 对应 Python: @app.post('/keywords/{cid}')
     @PostMapping("/keywords/{cid}")
     public Keyword addKeyword(@PathVariable String cid, @RequestBody Keyword keyword) {
         keyword.setCookieId(cid);
         return keywordRepository.save(keyword);
     }
-    
+
     // 对应 Python: @app.delete('/keywords/{cid}/{index}') 
     // Python used index, Java uses ID. 
     @DeleteMapping("/keywords/{cid}/{id}")
@@ -172,9 +205,9 @@ public class KeywordController {
         defaultReply.setCookieId(cid);
         return defaultReplyRepository.save(defaultReply);
     }
-    
+
     // ------------------------- AI Settings -------------------------
-    
+
     // GET /ai-reply-settings - Get all AI settings for current user (Aggregated)
     @GetMapping("/ai-reply-settings")
     public Map<String, AiReplySetting> getAllAiSettings() {
@@ -183,10 +216,10 @@ public class KeywordController {
                 .collect(Collectors.toList());
 
         List<AiReplySetting> settings = aiReplySettingRepository.findAllById(cookieIds);
-        
+
         return settings.stream().collect(Collectors.toMap(AiReplySetting::getCookieId, s -> s));
     }
-    
+
     @GetMapping("/ai-reply-settings/{cookieId}")
     public AiReplySetting getAiSetting(@PathVariable String cookieId) {
         return aiReplySettingRepository.findById(cookieId).orElse(null);
@@ -204,8 +237,148 @@ public class KeywordController {
         String userId = (String) testData.getOrDefault("user_id", "test_user");
         String itemId = (String) testData.getOrDefault("item_id", "test_item");
         String message = (String) testData.get("message");
-        
+
         String reply = aiReplyService.generateReply(cookieId, chatId, userId, itemId, message);
         return java.util.Collections.singletonMap("reply", reply);
+    }
+
+    // ------------------------- Default Reply Compatibility Routes -------------------------
+    // 兼容前端使用 /default-reply/ 单数形式的请求
+
+    /**
+     * 获取指定账号的默认回复设置（兼容路由）
+     * 对应 Python: @app.get('/default-reply/{cid}')
+     */
+    @GetMapping("/default-reply/{cid}")
+    public Map<String, Object> getDefaultReplyCompat(@PathVariable String cid,
+                                                     @RequestHeader(value = "Authorization", required = false) String token) {
+        // 验证用户权限
+        if (token != null) {
+            String rawToken = token.replace("Bearer ", "");
+            TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
+            if (tokenInfo != null) {
+                Long userId = tokenInfo.userId;
+                if (!Objects.equals(userId, 1L)) {
+                    Cookie cookie = cookieRepository.findById(cid).orElse(null);
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限访问该Cookie");
+                    }
+                }
+            }
+        }
+
+        // 获取默认回复设置
+        DefaultReply defaultReply = defaultReplyRepository.findById(cid).orElse(null);
+        if (defaultReply == null) {
+            // 如果没有设置，返回默认值（与 Python 实现一致）
+            Map<String, Object> result = new java.util.HashMap<>();
+            result.put("enabled", false);
+            result.put("reply_content", "");
+            result.put("reply_once", false);
+            result.put("reply_image_url", "");
+            return result;
+        }
+
+        // 返回结果（使用 Python 风格的字段名 snake_case）
+        Map<String, Object> result = new java.util.HashMap<>();
+        result.put("enabled", defaultReply.getEnabled());
+        result.put("reply_content", defaultReply.getReplyContent() != null ? defaultReply.getReplyContent() : "");
+        result.put("reply_once", defaultReply.getReplyOnce());
+        result.put("reply_image_url", defaultReply.getReplyImageUrl() != null ? defaultReply.getReplyImageUrl() : "");
+        return result;
+    }
+
+    /**
+     * 更新指定账号的默认回复设置（兼容路由）
+     * 对应 Python: @app.put('/default-reply/{cid}')
+     */
+    @PutMapping("/default-reply/{cid}")
+    public Map<String, Object> updateDefaultReplyCompat(@PathVariable String cid,
+                                                        @RequestBody DefaultReply defaultReply,
+                                                        @RequestHeader(value = "Authorization", required = false) String token) {
+        // 验证用户权限
+        if (token != null) {
+            String rawToken = token.replace("Bearer ", "");
+            TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
+            if (tokenInfo != null) {
+                Long userId = tokenInfo.userId;
+                if (!Objects.equals(userId, 1L)) {
+                    Cookie cookie = cookieRepository.findById(cid).orElse(null);
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限操作该Cookie");
+                    }
+                }
+            }
+        }
+
+        // 设置 cookieId 并保存
+        defaultReply.setCookieId(cid);
+        DefaultReply saved = defaultReplyRepository.save(defaultReply);
+
+        // 返回结果（与 Python 实现一致）
+        Map<String, Object> result = new java.util.HashMap<>();
+        result.put("msg", "default reply updated");
+        result.put("enabled", saved.getEnabled());
+        result.put("reply_once", saved.getReplyOnce());
+        result.put("reply_image_url", saved.getReplyImageUrl() != null ? saved.getReplyImageUrl() : "");
+        return result;
+    }
+
+    /**
+     * 删除指定账号的默认回复设置（兼容路由）
+     * 对应 Python: @app.delete('/default-reply/{cid}')
+     */
+    @DeleteMapping("/default-reply/{cid}")
+    public Map<String, String> deleteDefaultReplyCompat(@PathVariable String cid,
+                                                        @RequestHeader(value = "Authorization", required = false) String token) {
+        // 验证用户权限
+        if (token != null) {
+            String rawToken = token.replace("Bearer ", "");
+            TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
+            if (tokenInfo != null) {
+                Long userId = tokenInfo.userId;
+                if (!Objects.equals(userId, 1L)) {
+                    Cookie cookie = cookieRepository.findById(cid).orElse(null);
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限操作该Cookie");
+                    }
+                }
+            }
+        }
+
+        // 删除默认回复设置
+        try {
+            defaultReplyRepository.deleteById(cid);
+            return Map.of("msg", "default reply deleted");
+        } catch (Exception e) {
+            throw new RuntimeException("删除失败");
+        }
+    }
+
+    /**
+     * 清空指定账号的默认回复记录（兼容路由）
+     * 对应 Python: @app.post('/default-reply/{cid}/clear-records')
+     */
+    @PostMapping("/default-reply/{cid}/clear-records")
+    public Map<String, String> clearDefaultReplyRecordsCompat(@PathVariable String cid,
+                                                              @RequestHeader(value = "Authorization", required = false) String token) {
+        // 验证用户权限
+        if (token != null) {
+            String rawToken = token.replace("Bearer ", "");
+            TokenService.TokenInfo tokenInfo = tokenService.verifyToken(rawToken);
+            if (tokenInfo != null) {
+                Long userId = tokenInfo.userId;
+                if(!Objects.equals(userId, 1L)) {
+                    Cookie cookie = cookieRepository.findById(cid).orElse(null);
+                    if (cookie != null && !cookie.getUserId().equals(userId)) {
+                        throw new RuntimeException("无权限操作该Cookie");
+                    }
+                }
+            }
+        }
+
+        // 清空默认回复记录
+        defaultReplyRecordRepository.deleteByCookieId(cid);
+        return Map.of("msg", "default reply records cleared");
     }
 }

@@ -6,7 +6,7 @@ server:
 
 spring:
   application:
-    name: xianyu-auto-reply-backend
+    name: xianyu-free
 
   datasource:
     driver-class-name: org.sqlite.JDBC
@@ -22,10 +22,10 @@ spring:
     database-platform: org.hibernate.community.dialect.SQLiteDialect
     hibernate:
       ddl-auto: ${app.ddl-auto:update}
-    show-sql: false # Set to false to disable SQL logging
+    show-sql: true # Set to false to disable SQL logging
     properties:
       hibernate:
-        format_sql: false # Set to false to disable SQL formatting
+        format_sql: true # Set to false to disable SQL formatting
 
   servlet:
     multipart:

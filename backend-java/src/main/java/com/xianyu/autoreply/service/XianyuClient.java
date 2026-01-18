@@ -2089,7 +2089,7 @@ public class XianyuClient extends TextWebSocketHandler {
      */
     private int calculateRetryDelay(int failures) {
         // 根据失败次数计算延迟：3秒 * 失败次数,最多30秒
-        return Math.min(30 * failures, 120);
+        return Math.min(3 * failures, 30);
     }
 
     // ============== 消息发送方法 ==============
@@ -2536,7 +2536,7 @@ public class XianyuClient extends TextWebSocketHandler {
             // 对应Python: Line 7336-7391
             JSONObject message = decryptMessage(messageData);
             if (message == null) {
-                log.error("【{}】消息解密失败或为空", cookieId);
+                log.warn("【{}】消息解密失败或为空", cookieId);
                 return;
             }
 

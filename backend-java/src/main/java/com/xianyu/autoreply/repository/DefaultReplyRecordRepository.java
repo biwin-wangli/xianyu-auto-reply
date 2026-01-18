@@ -8,4 +8,5 @@ import java.util.Optional;
 @Repository
 public interface DefaultReplyRecordRepository extends JpaRepository<DefaultReplyRecord, Long> {
     Optional<DefaultReplyRecord> findByCookieIdAndChatId(String cookieId, String chatId);
+    void deleteByCookieId(String cookieId);
 }

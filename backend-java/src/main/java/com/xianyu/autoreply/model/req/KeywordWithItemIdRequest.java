@@ -1,6 +1,7 @@
-package com.xianyu.autoreply.dto;
+package com.xianyu.autoreply.model.req;
 
 import lombok.Data;
+
 import java.util.List;
 import java.util.Map;
 

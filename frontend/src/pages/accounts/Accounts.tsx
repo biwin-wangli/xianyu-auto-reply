@@ -22,7 +22,7 @@ export function Accounts() {
   const [loading, setLoading] = useState(true)
   const [accounts, setAccounts] = useState<AccountWithKeywordCount[]>([])
   const [activeModal, setActiveModal] = useState<ModalType>(null)
-  
+
   // 默认密码检查状态
   const [usingDefaultPassword, setUsingDefaultPassword] = useState(false)
   const [showPasswordWarning, setShowPasswordWarning] = useState(false)
@@ -124,7 +124,7 @@ export function Accounts() {
   // 单独的 useEffect 检查默认密码
   useEffect(() => {
     if (!_hasHydrated || !isAuthenticated || !token || !user) return
-    
+
     // 检查是否使用默认密码
     const checkPassword = async () => {
       if (user.is_admin) {
@@ -165,7 +165,7 @@ export function Accounts() {
       setShowPasswordWarning(true)
       return
     }
-    
+
     setActiveModal('qrcode')
     setQrStatus('loading')
     try {
@@ -185,7 +185,7 @@ export function Accounts() {
       addToast({ type: 'error', message: '生成二维码失败' })
     }
   }
-  
+
   // 检查默认密码后打开弹窗
   const handleOpenModal = (modal: ModalType) => {
     if (usingDefaultPassword && (modal === 'password' || modal === 'manual')) {
@@ -394,11 +394,11 @@ export function Accounts() {
       }
 
       // 更新登录信息
-      const loginInfoChanged = 
+      const loginInfoChanged =
         editUsername !== (editingAccount.username || '') ||
         editLoginPassword !== (editingAccount.login_password || '') ||
         editShowBrowser !== (editingAccount.show_browser || false)
-      
+
       if (loginInfoChanged) {
         promises.push(updateAccountLoginInfo(editingAccount.id, {
           username: editUsername,
@@ -424,7 +424,7 @@ export function Accounts() {
     setDefaultReplyContent('')
     setDefaultReplyImageUrl('')
     setActiveModal('default-reply')
-    
+
     // 加载当前默认回复
     try {
       const result = await getDefaultReply(account.id)
@@ -437,7 +437,7 @@ export function Accounts() {
 
   const handleSaveDefaultReply = async () => {
     if (!defaultReplyAccount) return
-    
+
     try {
       setDefaultReplySaving(true)
       await updateDefaultReply(defaultReplyAccount.id, defaultReplyContent, true, false, defaultReplyImageUrl)
@@ -454,12 +454,12 @@ export function Accounts() {
   const handleUploadDefaultReplyImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    
+
     try {
       setUploadingDefaultReplyImage(true)
       const formData = new FormData()
       formData.append('image', file)
-      
+
       const response = await fetch('/upload-image', {
         method: 'POST',
         headers: {
@@ -467,7 +467,7 @@ export function Accounts() {
         },
         body: formData
       })
-      
+
       const result = await response.json()
       if (result.image_url) {
         setDefaultReplyImageUrl(result.image_url)
@@ -491,7 +491,7 @@ export function Accounts() {
       const currentSettings = await getAIReplySettings(account.id)
       await updateAIReplySettings(account.id, {
         ...currentSettings,
-        enabled: newEnabled,
+        ai_enabled: newEnabled,
       })
       setAccounts(prev => prev.map(a =>
         a.id === account.id ? { ...a, aiEnabled: newEnabled } : a,
@@ -526,7 +526,7 @@ export function Accounts() {
     try {
       setAiSettingsSaving(true)
       await updateAIReplySettings(aiSettingsAccount.id, {
-        enabled: aiEnabled,
+        ai_enabled: aiEnabled,
         max_discount_percent: aiMaxDiscountPercent,
         max_discount_amount: aiMaxDiscountAmount,
         max_bargain_rounds: aiMaxBargainRounds,
@@ -674,11 +674,10 @@ export function Accounts() {
                     <td>
                       <button
                         onClick={() => handleToggleAI(account)}
-                        className={`inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors ${
-                          account.aiEnabled 
-                            ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 hover:bg-purple-200 dark:hover:bg-purple-900/50' 
-                            : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'
-                        }`}
+                        className={`inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors ${account.aiEnabled
+                          ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 hover:bg-purple-200 dark:hover:bg-purple-900/50'
+                          : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'
+                          }`}
                         title={account.aiEnabled ? '点击关闭AI回复' : '点击开启AI回复'}
                       >
                         <Bot className="w-3.5 h-3.5" />
@@ -991,14 +990,12 @@ export function Accounts() {
                   <button
                     type="button"
                     onClick={() => setEditAutoConfirm(!editAutoConfirm)}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      editAutoConfirm ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
-                    }`}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${editAutoConfirm ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
+                      }`}
                   >
                     <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                        editAutoConfirm ? 'translate-x-6' : 'translate-x-1'
-                      }`}
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${editAutoConfirm ? 'translate-x-6' : 'translate-x-1'
+                        }`}
                     />
                   </button>
                 </div>
@@ -1067,14 +1064,12 @@ export function Accounts() {
                       <button
                         type="button"
                         onClick={() => setEditShowBrowser(!editShowBrowser)}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                          editShowBrowser ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
-                        }`}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${editShowBrowser ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-600'
+                          }`}
                       >
                         <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                            editShowBrowser ? 'translate-x-6' : 'translate-x-1'
-                          }`}
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${editShowBrowser ? 'translate-x-6' : 'translate-x-1'
+                            }`}
                         />
                       </button>
                     </div>

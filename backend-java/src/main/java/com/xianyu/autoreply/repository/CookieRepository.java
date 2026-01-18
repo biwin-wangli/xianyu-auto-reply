@@ -9,4 +9,5 @@ import java.util.List;
 @Repository
 public interface CookieRepository extends JpaRepository<Cookie, String> {
     List<Cookie> findByUserId(Long userId);
+    long countByEnabled(Boolean enabled);
 }
