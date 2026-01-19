@@ -177,14 +177,14 @@ public class ItemController extends BaseController {
                                                @PathVariable String item_id,
                                                @RequestBody Map<String, Boolean> body) {
         ItemInfo item = itemInfoRepository.findByCookieIdAndItemId(cookie_id, item_id)
-                .orElseThrow(() -> new RuntimeException("Item not found"));
+                .orElseThrow(() -> new RuntimeException("商品不存在"));
 
-        Boolean enabled = body.get("enabled");
+        Boolean enabled = body.getOrDefault("is_multi_spec", false);
         if (enabled != null) {
             item.setIsMultiSpec(enabled);
             itemInfoRepository.save(item);
         }
-        return Map.of("success", true, "msg", "Multi-spec setting updated");
+        return Map.of("success", true, "msg", "商品多规格状态已" + (Objects.equals(Boolean.TRUE, enabled) ? "开启" : "关闭"));
     }
 
     @PutMapping("/items/{cookie_id}/{item_id}/multi-quantity-delivery")
@@ -192,14 +192,14 @@ public class ItemController extends BaseController {
                                                            @PathVariable String item_id,
                                                            @RequestBody Map<String, Boolean> body) {
         ItemInfo item = itemInfoRepository.findByCookieIdAndItemId(cookie_id, item_id)
-                .orElseThrow(() -> new RuntimeException("Item not found"));
+                .orElseThrow(() -> new RuntimeException("商品不存在"));
 
-        Boolean enabled = body.get("enabled");
+        Boolean enabled = body.getOrDefault("multi_quantity_delivery", false);
         if (enabled != null) {
             item.setMultiQuantityDelivery(enabled);
             itemInfoRepository.save(item);
         }
-        return Map.of("success", true, "msg", "Multi-quantity delivery setting updated");
+        return Map.of("success", true, "msg", "商品多数量发货状态已" + (Objects.equals(Boolean.TRUE, enabled) ? "开启" : "关闭"));
     }
 
     // ------------------------- Sync (Stub/Trigger) -------------------------

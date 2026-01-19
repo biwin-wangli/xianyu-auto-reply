@@ -527,19 +527,29 @@ public class BrowserService {
     }
 
     private boolean attemptQuickLogin(Frame frame) {
-        boolean containerFound = false;
-        if (Objects.isNull(frame)) return containerFound;
-        ElementHandle elementHandle = frame.querySelector("#alibaba-login-box");
-        if (Objects.isNull(elementHandle)) return containerFound;
-        Frame quickLoginFrame = elementHandle.contentFrame();
-        if (Objects.isNull(quickLoginFrame)) return containerFound;
-        ElementHandle loginButton = quickLoginFrame.querySelector(".fm-button.fm-submit");
-        if (Objects.isNull(loginButton)) return containerFound;
-        if (loginButton.isVisible()) {
-            loginButton.click();
-            return true;
+        try {
+            boolean containerFound = false;
+            if (Objects.isNull(frame)) return containerFound;
+
+            // 检查frame所属的page是否已关闭
+            if (frame.page().isClosed()) {
+                return containerFound;
+            }
+            ElementHandle elementHandle = frame.querySelector("#alibaba-login-box");
+            if (Objects.isNull(elementHandle)) return containerFound;
+            Frame quickLoginFrame = elementHandle.contentFrame();
+            if (Objects.isNull(quickLoginFrame)) return containerFound;
+            ElementHandle loginButton = quickLoginFrame.querySelector(".fm-button.fm-submit");
+            if (Objects.isNull(loginButton)) return containerFound;
+            if (loginButton.isVisible()) {
+                loginButton.click();
+                return true;
+            }
+            return false;
+        } catch (Exception e) {
+            // 捕获所有异常，包括TargetClosedError，防止中断流程
+            return false;
         }
-        return false;
     }
 
     private boolean attemptQuickLoginV2(Frame frame) {
@@ -612,69 +622,123 @@ public class BrowserService {
                 page.navigate(targetUrl, new Page.NavigateOptions()
                         .setTimeout(20000)
                         .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                log.info("【{}-Cookie Refresh】导航完成，等待页面稳定...", cookieId);
             } catch (Exception e) {
                 log.warn("【{}-Cookie Refresh】导航超时，尝试降级...", cookieId);
                 try {
                     page.navigate(targetUrl, new Page.NavigateOptions()
                             .setTimeout(30000)
-                            .setWaitUntil(WaitUntilState.LOAD));
+                            .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
                 } catch (Exception ex) {
                     log.warn("【{}-Cookie Refresh】降级导航也超时，继续执行", cookieId);
                 }
             }
 
-            // 3. 等待页面加载
+            // 等待页面基本内容加载完成后，再等待额外时间让iframe加载
+            log.debug("【{}-Cookie Refresh】等待页面加载...", cookieId);
             try {
                 Thread.sleep(5000);
-            } catch (Exception e) {
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
 
 
-            // 判断是否有快捷登陆iframe
-            for (Frame frame : page.frames()) {
-                if (attemptQuickLogin(frame)) {
-                    break;
+            // 判断是否有快捷登陆iframe - 添加重试机制和页面状态检查
+            log.debug("【{}-Cookie Refresh】尝试查找快捷登陆或封控处理...", cookieId);
+            int maxRetries = 3;
+            for (int retry = 0; retry < maxRetries; retry++) {
+                try {
+                    // 检查页面是否仍然有效
+                    if (page.isClosed()) {
+                        log.warn("【{}-Cookie Refresh】页面已关闭，跳过快捷登陆尝试", cookieId);
+                        break;
+                    }
+
+                    List<Frame> frames = page.frames();
+                    log.info("【{}-Cookie Refresh】尝试处理滑块...", cookieId);
+                    try {
+                        boolean sliderFound = solveSliderRecursively(page);
+                        if (sliderFound) {
+                            log.info("【{}-Cookie Refresh】处理滑块完成", cookieId);
+                            Thread.sleep(3000);
+                            page.reload();
+                            Thread.sleep(2000);
+                            continue;
+                        }
+                    } catch (Exception e) {
+                        log.debug("【{}-Cookie Refresh】滑块处理异常: {}", cookieId, e.getMessage());
+                    }
+
+                    log.debug("【{}-Cookie Refresh】当前页面有 {} 个frame，尝试第 {} 次查找", cookieId, frames.size(), retry + 1);
+                    for (Frame frame : frames) {
+                        try {
+                            log.info("【{}-Cookie Refresh】尝试快捷登陆...", cookieId);
+                            attemptQuickLogin(frame);
+                            Thread.sleep(2000);
+                        } catch (Exception frameEx) {
+                            log.debug("【{}-Cookie Refresh】frame操作异常（可能frame尚未就绪）: {}", cookieId, frameEx.getMessage());
+                        }
+                    }
+
+                    // 如果没有找到，等待后重试
+                    if (retry < maxRetries - 1) {
+                        log.debug("【{}-Cookie Refresh】未找到快捷登陆按钮，等待2秒后重试...", cookieId);
+                        Thread.sleep(2000);
+                    }
+                } catch (Exception e) {
+                    log.warn("【{}-Cookie Refresh】查找快捷登陆按钮时异常: {}", cookieId, e.getMessage());
+                    if (retry < maxRetries - 1) {
+                        try {
+                            Thread.sleep(2000);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
                 }
             }
 
-            // 4. 重新加载页面以触发Cookie刷新
+            // 3. 重新加载页面以触发Cookie刷新
             log.info("【{}-Cookie Refresh】重新加载页面...", cookieId);
             try {
-                page.reload(new Page.ReloadOptions()
-                        .setTimeout(20000)
-                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                // 检查页面是否仍然有效
+                if (!page.isClosed()) {
+                    page.reload(new Page.ReloadOptions()
+                            .setTimeout(20000)
+                            .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                    // 等待reload完成后的稳定时间
+                    Thread.sleep(2000);
+                } else {
+                    log.warn("【{}-Cookie Refresh】页面已关闭，跳过reload", cookieId);
+                }
             } catch (Exception e) {
-                log.warn("【{}-Cookie Refresh】重新加载超时，继续执行", cookieId);
-            }
-            try {
-                Thread.sleep(2000);
-            } catch (Exception e) {
+                log.warn("【{}-Cookie Refresh】重新加载超时或异常，继续执行: {}", cookieId, e.getMessage());
             }
 
-            // 5. 获取刷新后的Cookie（从持久化上下文中获取）
+            // 4. 获取刷新后的Cookie（从持久化上下文中获取）
             List<com.microsoft.playwright.options.Cookie> newCookies = context.cookies();
             log.info("【{}-Cookie Refresh】获取到 {} 个Cookie", cookieId, newCookies.size());
 
-            // 6. 构建Cookie Map
+            // 5. 构建Cookie Map
             Map<String, String> newCookieMap = new HashMap<>();
             for (com.microsoft.playwright.options.Cookie c : newCookies) {
                 newCookieMap.put(c.name, c.value);
             }
 
-            // 7. 验证必要Cookie
+            // 6. 验证必要Cookie
             if (!newCookieMap.containsKey("unb")) {
                 log.warn("【{}-Cookie Refresh】刷新后的Cookie缺少'unb'字段，可能已失效", cookieId);
                 return Collections.emptyMap();
             }
 
-            // 8. 构建Cookie字符串并保存到数据库
+            // 7. 构建Cookie字符串并保存到数据库
             StringBuilder sb = new StringBuilder();
             for (Map.Entry<String, String> entry : newCookieMap.entrySet()) {
                 sb.append(entry.getKey()).append("=").append(entry.getValue()).append("; ");
             }
             String newCookieStr = sb.toString();
 
-            // 9. 更新数据库
+            // 8. 更新数据库
             if (!newCookieStr.equals(cookie.getValue())) {
                 cookie.setValue(newCookieStr);
                 log.debug("【{}】🤖刷新浏览器后获取到的 cookie 为: {}", cookieId, newCookieStr);
@@ -684,7 +748,7 @@ public class BrowserService {
                 log.info("【{}-Cookie Refresh】Cookie未变化，无需更新数据库", cookieId);
             }
 
-            // 10. Cookie已自动保存到UserData目录（持久化）
+            // 9. Cookie已自动保存到UserData目录（持久化）
             log.info("【{}-Cookie Refresh】✅ Cookie刷新完成（已持久化到磁盘）: {}", cookieId, cookieId);
             return newCookieMap;
 

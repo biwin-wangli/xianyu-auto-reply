@@ -59,6 +59,7 @@ public class XianyuClient extends TextWebSocketHandler {
     private static final int HEARTBEAT_TIMEOUT = 90; // 心跳超时（秒）
     private static final int TOKEN_REFRESH_INTERVAL = 72000; // Token刷新间隔（秒），20小时
     private static final int TOKEN_RETRY_INTERVAL = 7200; // Token重试间隔（秒），2小时
+    private static final int TOKEN_REFRESH_MAX_RETRIES = 3; // Token刷新最大重试次数
     private static final int MESSAGE_COOLDOWN = 300; // 消息冷却时间（秒），5分钟
     private static final int CLEANUP_INTERVAL = 300; // 清理间隔（秒），5分钟
     private static final int COOKIE_REFRESH_INTERVAL = 1200; // Cookie刷新间隔（秒），20分钟
@@ -196,9 +197,11 @@ public class XianyuClient extends TextWebSocketHandler {
      * 连接状态枚举
      */
     public enum ConnectionState {
+        INIT("init"),
         DISCONNECTED("disconnected"),
         CONNECTING("connecting"),
         CONNECTED("connected"),
+        REGISTER("register"),
         RECONNECTING("reconnecting"),
         FAILED("failed"),
         CLOSED("closed");
@@ -374,7 +377,7 @@ public class XianyuClient extends TextWebSocketHandler {
                 }
 
                 // 更新连接状态
-                setConnectionState(ConnectionState.CONNECTING, "准备建立WebSocket连接");
+                setConnectionState(ConnectionState.INIT, "准备建立WebSocket连接");
                 log.info("【{}】WebSocket目标地址: {}", cookieId, WEBSOCKET_URL);
 
                 // 单次连接尝试
@@ -460,8 +463,9 @@ public class XianyuClient extends TextWebSocketHandler {
             ListenableFuture<WebSocketSession> future =
                     client.doHandshake(this, headers, URI.create(WEBSOCKET_URL));
 
-            // 等待连接完成（超时10秒）
-            this.webSocketSession = future.get(10, TimeUnit.SECONDS);
+            // 等待连接完成（超时30秒）
+            // 注意：由于 afterConnectionEstablished 已异步化，这个超时仅用于 WebSocket 握手本身
+            this.webSocketSession = future.get(30, TimeUnit.SECONDS);
             log.info("【{}】WebSocket连接建立成功", cookieId);
 
         } catch (InterruptedException e) {
@@ -500,37 +504,47 @@ public class XianyuClient extends TextWebSocketHandler {
      */
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
-        log.info("【{}】WebSocket连接已建立，开始初始化...", cookieId);
+        log.info("【{}】WebSocket连接已建立", cookieId);
         this.webSocketSession = session;
-
-        // 初始化连接
-        try {
-            log.info("【{}】准备调用init()方法...", cookieId);
-            init(session);
-            log.info("【{}】WebSocket初始化完成！", cookieId);
-
-            // 更新连接状态
-            setConnectionState(ConnectionState.CONNECTED, "初始化完成，连接就绪");
-            connectionFailures.set(0);
-            lastSuccessfulConnection.set(System.currentTimeMillis());
-            connected.set(true);
-
-            // 启动后台任务
-            startBackgroundTasks();
-
-            log.info("【{}】✅ WebSocket连接和初始化全部完成", cookieId);
-
-        } catch (Exception e) {
-            log.error("【{}】❌ WebSocket初始化失败: {}", cookieId, e.getMessage(), e);
-            log.error("【{}】异常类型: {}", cookieId, e.getClass().getName());
-            log.error("【{}】异常堆栈:", cookieId, e);
-            connected.set(false);
-            // 关闭连接，触发重连
-            if (session.isOpen()) {
-                session.close();
+        
+        // 更新连接状态（连接已建立，但尚未初始化）
+        setConnectionState(ConnectionState.CONNECTED, "握手完成，准备初始化");
+        connected.set(true);  // 标记连接已建立
+        
+        // 异步执行初始化（不阻塞连接建立过程）
+        // 这样可以避免 init() 中的耗时操作（如refreshToken）导致连接超时
+        CompletableFuture.runAsync(() -> {
+            try {
+                log.info("【{}】开始异步初始化...", cookieId);
+                init(session);
+                log.info("【{}】WebSocket初始化完成！", cookieId);
+                
+                // 更新连接状态
+                setConnectionState(ConnectionState.REGISTER, "初始化完成，连接就绪");
+                connectionFailures.set(0);
+                lastSuccessfulConnection.set(System.currentTimeMillis());
+                
+                // 启动后台任务
+                startBackgroundTasks();
+                
+                log.info("【{}】✅ WebSocket连接和初始化全部完成", cookieId);
+                
+            } catch (Exception e) {
+                log.error("【{}】❌ WebSocket初始化失败: {}", cookieId, e.getMessage(), e);
+                log.error("【{}】异常类型: {}", cookieId, e.getClass().getName());
+                log.error("【{}】异常堆栈:", cookieId, e);
+                connected.set(false);
+                
+                // 关闭连接，触发重连
+                try {
+                    if (session.isOpen()) {
+                        session.close();
+                    }
+                } catch (Exception closeEx) {
+                    log.error("【{}】关闭连接失败", cookieId, closeEx);
+                }
             }
-            throw e;
-        }
+        }, scheduledExecutor);  // 使用已有的线程池执行异步任务
     }
 
 
@@ -590,17 +604,13 @@ public class XianyuClient extends TextWebSocketHandler {
      */
     private void init(WebSocketSession session) throws Exception {
         log.info("【{}】========== 开始初始化WebSocket连接 ==========", cookieId);
-
-        // 刷新Token
-        boolean tokenRefreshAttempted = false;
-        long currentTime = System.currentTimeMillis();
-
         log.info("【{}】检查Token状态... currentToken={}, lastRefresh={}",
                 cookieId, currentToken != null ? "存在" : "不存在", lastTokenRefreshTime.get());
 
+        // 刷新Token
+        long currentTime = System.currentTimeMillis();
         if (currentToken == null || (currentTime - lastTokenRefreshTime.get()) >= TOKEN_REFRESH_INTERVAL * 1000L) {
             log.info("【{}】需要刷新token，开始调用refreshToken()...", cookieId);
-            tokenRefreshAttempted = true;
 
             try {
                 refreshToken();
@@ -687,52 +697,82 @@ public class XianyuClient extends TextWebSocketHandler {
 
 
     /**
-     * 刷新Token - 重构版本，去除嵌套循环
-     * 策略：尝试获取Token，失败则刷新Cookie后抛异常，由上层决定是否重试
+     * 刷新Token - 优化版本，使用迭代循环替代递归
+     * 策略：使用while循环进行重试，集成滑块验证处理，设置最大重试次数防止无限循环
      */
     private String refreshToken() {
         lastTokenRefreshStatus = "started";
         log.info("【{}】开始刷新token...", cookieId);
 
-        // 检查是否在消息冷却期内
-        long currentTime = System.currentTimeMillis();
-        long timeSinceLastMessage = currentTime - lastMessageReceivedTime.get();
-        if (lastMessageReceivedTime.get() > 0 && timeSinceLastMessage < MESSAGE_COOLDOWN * 1000L) {
-            long remainingTime = MESSAGE_COOLDOWN * 1000L - timeSinceLastMessage;
-            log.info("【{}】收到消息后冷却中，放弃本次token刷新，还需等待 {} 秒",
-                    cookieId, remainingTime / 1000);
-            lastTokenRefreshStatus = "skipped_cooldown";
-            return null;
+        int attempt = 0;
+        final int BASE_DELAY_MS = 1000; // 基础延迟1秒
+
+        while (attempt < TOKEN_REFRESH_MAX_RETRIES) {
+            attempt++;
+            log.info("【{}】Token刷新尝试 {}/{}", cookieId, attempt, TOKEN_REFRESH_MAX_RETRIES);
+
+            // 检查是否在消息冷却期内
+            long currentTime = System.currentTimeMillis();
+            long timeSinceLastMessage = currentTime - lastMessageReceivedTime.get();
+            if (lastMessageReceivedTime.get() > 0 && timeSinceLastMessage < MESSAGE_COOLDOWN * 1000L) {
+                long remainingTime = MESSAGE_COOLDOWN * 1000L - timeSinceLastMessage;
+                log.info("【{}】收到消息后冷却中，放弃本次token刷新，还需等待 {} 秒",
+                        cookieId, remainingTime / 1000);
+                lastTokenRefreshStatus = "skipped_cooldown";
+                return null;
+            }
+
+            // 从数据库重新加载Cookie（可能已被浏览器刷新更新）
+            reloadCookieFromDatabase();
+
+            // 尝试获取Token
+            log.debug("【{}】🤖准备调用官方API获取Token（尝试 {}/{}）...", cookieId, attempt, TOKEN_REFRESH_MAX_RETRIES);
+            String token = attemptGetToken();
+            log.debug("【{}】🤖调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
+
+            if (token != null) {
+                // Token获取成功
+                this.currentToken = token;
+                this.lastTokenRefreshTime.set(System.currentTimeMillis());
+                this.lastMessageReceivedTime.set(0);
+                log.warn("【{}】✅ Token刷新成功（第 {} 次尝试）", cookieId, attempt);
+                lastTokenRefreshStatus = "success";
+                return token;
+            }
+
+            // Token获取失败，检查是否需要滑块验证
+            log.warn("【{}】⚠️ Token获取失败（第 {} 次尝试），尝试通过页面刷新获取Cookie...", cookieId, attempt);
+
+            // 尝试通过浏览器刷新Cookie
+            refreshCookieViaBrowser();
+
+            // Cookie刷新后，再次尝试获取Token
+            log.debug("【{}】🤖刷新Cookie后再次调用官方API获取Token...", cookieId);
+            token = attemptGetToken();
+            log.debug("【{}】🤖刷新Cookie后调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
+
+            if (token != null) {
+                // Token获取成功
+                this.currentToken = token;
+                this.lastTokenRefreshTime.set(System.currentTimeMillis());
+                this.lastMessageReceivedTime.set(0);
+                log.warn("【{}】✅ Token刷新成功（刷新Cookie后，第 {} 次尝试）", cookieId, attempt);
+                lastTokenRefreshStatus = "success";
+                return token;
+            }
+
+            // 仍然失败，应用指数退避策略（除非是最后一次尝试）
+            if (attempt < TOKEN_REFRESH_MAX_RETRIES) {
+                int delayMs = BASE_DELAY_MS * (1 << (attempt - 1)); // 指数退避: 1s, 2s, 4s
+                log.warn("【{}】Token刷新失败，等待 {}ms 后进行下一次尝试...", cookieId, delayMs);
+                sleepWithInterruptCheck(delayMs);
+            }
         }
 
-        // 从数据库重新加载Cookie（可能已被浏览器刷新更新）
-        reloadCookieFromDatabase();
-
-        // 尝试获取Token
-        log.debug("【{}】🤖准备调用官方API获取Token...", cookieId);
-        String token = attemptGetToken();
-        log.debug("【{}】🤖调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
-
-        if (token != null) {
-            // Token获取成功
-            this.currentToken = token;
-            this.lastTokenRefreshTime.set(System.currentTimeMillis());
-            this.lastMessageReceivedTime.set(0);
-            log.warn("【{}】✅ Token刷新成功", cookieId);
-            lastTokenRefreshStatus = "success";
-            return token;
-        }
-
-        // Token获取失败，尝试刷新Cookie然后返回null
-        // 不在这里重试，失败后让connectionLoop处理重连
-        log.warn("【{}】⚠️ Token获取失败，尝试通过浏览器刷新Cookie...", cookieId);
-        refreshCookieViaBrowser();
-
-        // 尝试获取Token
-        log.debug("【{}】🤖刷新Cookie后调用官方API获取Token...", cookieId);
-        token = attemptGetToken();
-        log.debug("【{}】🤖刷新Cookie后调用官方API获取Token结果: {}", cookieId, token != null ? "成功" : "失败");
-        return token;
+        // 所有重试都失败
+        log.error("【{}】❌ Token刷新失败，已达最大重试次数 {}", cookieId, TOKEN_REFRESH_MAX_RETRIES);
+        lastTokenRefreshStatus = "failed";
+        return null;
     }
 
     /**
@@ -852,12 +892,8 @@ public class XianyuClient extends TextWebSocketHandler {
 
             // 检查是否需要滑块验证
             if (needsCaptchaVerification(resJson)) {
-                log.warn("【{}】检测到滑块验证要求", cookieId);
-                // 这里需要决定如何处理滑块验证。
-                // 如果是attemptGetToken，可能直接返回null，让上层refreshToken决定是否重试或刷新cookie
-                // 或者直接抛出异常，让上层捕获
-                // 暂时返回null，让refreshToken的重试机制处理
-                handleCaptchaAndRetry(resJson); // 仍然调用，但其返回值不直接影响这里的return
+                log.warn("【{}】检测到滑块验证要求，需要刷新Cookie", cookieId);
+                // 不再递归调用，由上层refreshToken的循环逻辑处理
                 return null;
             }
 
@@ -1588,65 +1624,7 @@ public class XianyuClient extends TextWebSocketHandler {
         }
     }
 
-    /**
-     * 处理滑块验证并重试Token刷新
-     */
-    private String handleCaptchaAndRetry(JSONObject resJson) {
-        try {
-            // 获取验证URL
-            String verificationUrl = null;
-            if (resJson.containsKey("data")) {
-                JSONObject data = resJson.getJSONObject("data");
-                if (data.containsKey("url")) {
-                    verificationUrl = data.getString("url");
-                }
-            }
 
-            if (verificationUrl == null) {
-                log.warn("【{}】未找到验证URL，无法进行滑块验证", cookieId);
-                return null;
-            }
-
-            log.info("【{}】开始滑块验证处理...", cookieId);
-            log.info("【{}】验证URL: {}", cookieId, verificationUrl);
-
-            // 调用滑块验证处理器
-            com.xianyu.autoreply.service.captcha.model.CaptchaResult result =
-                    captchaHandler.handleCaptcha(verificationUrl, cookieId);
-
-            if (result.isSuccess()) {
-                log.info("【{}】滑块验证成功！耗时: {}ms", cookieId, result.getDuration());
-
-                // 更新cookies
-                Map<String, String> newCookies = result.getCookies();
-                if (newCookies != null && !newCookies.isEmpty()) {
-                    // 合并cookies
-                    for (Map.Entry<String, String> entry : newCookies.entrySet()) {
-                        this.cookies.put(entry.getKey(), entry.getValue());
-                        log.info("【{}】更新cookie: {} = {}", cookieId, entry.getKey(), entry.getValue());
-                    }
-
-                    // 更新cookies字符串
-                    updateCookiesString();
-                    log.debug("【{}】🤖更新后的完整 cookie:{}", cookieId, this.cookiesStr);
-
-                    // 保存到数据库
-                    saveCookiesToDatabase();
-                }
-
-                // 重新尝试刷新Token
-                log.info("【{}】滑块验证成功，重新尝试刷新Token...", cookieId);
-                return refreshToken();
-            } else {
-                log.error("【{}】滑块验证失败: {}", cookieId, result.getMessage());
-                return null;
-            }
-
-        } catch (Exception e) {
-            log.error("【{}】滑块验证处理异常", cookieId, e);
-            return null;
-        }
-    }
 
     /**
      * 更新cookies字符串
