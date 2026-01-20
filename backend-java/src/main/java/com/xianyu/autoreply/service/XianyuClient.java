@@ -167,7 +167,7 @@ public class XianyuClient extends TextWebSocketHandler {
     private final Set<CompletableFuture<Void>> backgroundTasks = ConcurrentHashMap.newKeySet(); // 追踪所有后台任务
 
     // ============== 消息防抖管理 ==============
-    private final Map<String, MessageDebounceInfo> messageDebounnceTasks = new ConcurrentHashMap<>(); // 消息防抖任务
+    private final Map<String, MessageDebounceInfo> messageDebounceTasks = new ConcurrentHashMap<>(); // 消息防抖任务
     private static final int MESSAGE_DEBOUNCE_DELAY = 1; // 防抖延迟时间（秒）
     private final ReentrantLock messageDebounceLock = new ReentrantLock(); // 防抖任务管理的锁
     private final ReentrantLock processedMessageIdsLock = new ReentrantLock(); // 消息ID去重的锁
@@ -2081,60 +2081,196 @@ public class XianyuClient extends TextWebSocketHandler {
      * 发送文本消息
      * 对应Python的send_msg()方法
      */
+    /**
+     * 发送文本消息
+     * 对应Python: send_msg (Line 5152-5196)
+     * 
+     * @param session WebSocket会话
+     * @param chatId 聊天ID
+     * @param toUserId 接收者用户ID
+     * @param content 消息文本内容
+     */
     private void sendMsg(WebSocketSession session, String chatId, String toUserId, String content) throws Exception {
         if (session == null || !session.isOpen()) {
             throw new Exception("WebSocket连接已关闭");
         }
 
+        // 1. 构造文本内容（对应Python Line 5153-5158）
+        JSONObject textContent = new JSONObject();
+        textContent.put("contentType", 1);
+        JSONObject textObj = new JSONObject();
+        textObj.put("text", content);
+        textContent.put("text", textObj);
+
+        // 2. Base64编码（对应Python Line 5159）
+        String textBase64 = java.util.Base64.getEncoder().encodeToString(
+            textContent.toJSONString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        // 3. 构造消息结构（对应Python Line 5160-5195）
         JSONObject msg = new JSONObject();
-        msg.put("lwp", "/r/ImCore/sendMsg");
+        msg.put("lwp", "/r/MessageSend/sendByReceiverScope");
 
         JSONObject headers = new JSONObject();
         headers.put("mid", XianyuUtils.generateMid());
         msg.put("headers", headers);
 
-        JSONObject body = new JSONObject();
-        body.put("cid", chatId);
-        body.put("toUser", toUserId);
-        body.put("type", "text");
-        body.put("content", content);
-
+        JSONArray body = new JSONArray();
+        
+        // Body第一部分：消息内容
+        JSONObject bodyPart1 = new JSONObject();
+        bodyPart1.put("uuid", XianyuUtils.generateUuid());
+        bodyPart1.put("cid", chatId + "@goofish");
+        bodyPart1.put("conversationType", 1);
+        
+        JSONObject contentObj = new JSONObject();
+        contentObj.put("contentType", 101);
+        JSONObject custom = new JSONObject();
+        custom.put("type", 1);
+        custom.put("data", textBase64);
+        contentObj.put("custom", custom);
+        bodyPart1.put("content", contentObj);
+        
+        bodyPart1.put("redPointPolicy", 0);
+        JSONObject extension = new JSONObject();
+        extension.put("extJson", "{}");
+        bodyPart1.put("extension", extension);
+        
+        JSONObject ctx = new JSONObject();
+        ctx.put("appVersion", "1.0");
+        ctx.put("platform", "web");
+        bodyPart1.put("ctx", ctx);
+        
+        bodyPart1.put("mtags", new JSONObject());
+        bodyPart1.put("msgReadStatusSetting", 1);
+        
+        body.add(bodyPart1);
+        
+        // Body第二部分：接收者列表（对应Python Line 5188-5193）
+        JSONObject bodyPart2 = new JSONObject();
+        JSONArray actualReceivers = new JSONArray();
+        actualReceivers.add(toUserId + "@goofish");
+        actualReceivers.add(myId + "@goofish");
+        bodyPart2.put("actualReceivers", actualReceivers);
+        
+        body.add(bodyPart2);
+        
         msg.put("body", body);
 
+        // 4. 发送消息（对应Python Line 5196）
         session.sendMessage(new TextMessage(msg.toJSONString()));
         log.info("【{}】已发送文本消息到聊天: {}", cookieId, chatId);
     }
 
     /**
      * 发送图片消息
-     * 对应Python的send_image_msg()方法
+     * 对应Python: send_image_msg (Line 8354-8475)
+     * 
+     * @param session WebSocket会话
+     * @param chatId 聊天ID
+     * @param toUserId 接收者用户ID
+     * @param imageUrl 图片URL
+     * @param cardId 卡券ID（可选，用于卡券图片）
      */
     private void sendImageMsg(WebSocketSession session, String chatId, String toUserId, String imageUrl, Integer cardId) throws Exception {
         if (session == null || !session.isOpen()) {
             throw new Exception("WebSocket连接已关闭");
         }
 
+        // TODO: 图片CDN上传逻辑（对应Python Line 8357-8400）
+        // Python中会检查图片URL类型：
+        // 1. 已是CDN链接 -> 直接使用
+        // 2. 本地图片 (/static/uploads/) -> 上传到闲鱼CDN
+        // 3. 其他URL -> 直接使用
+        // Java简化实现：直接使用图片URL，不处理本地图片上传
+        
+        // 默认图片尺寸（对应Python Line 8354默认参数 width=800, height=600）
+        int width = 800;
+        int height = 600;
+        
+        // TODO: 从图片URL获取真实尺寸（对应Python Line 8386-8391）
+        // Python中会调用 image_manager.get_image_size() 获取实际尺寸
+        // Java简化实现：使用默认尺寸
+        
+        log.info("【{}】准备发送图片消息:", cookieId);
+        log.info("  - 图片URL: {}", imageUrl);
+        log.info("  - 图片尺寸: {}x{}", width, height);
+        log.info("  - 聊天ID: {}", chatId);
+        log.info("  - 接收者ID: {}", toUserId);
+
+        // 1. 构造图片内容（对应Python Line 8411-8423）
+        JSONObject imageContent = new JSONObject();
+        imageContent.put("contentType", 2);  // 图片消息类型
+        JSONObject imageObj = new JSONObject();
+        JSONArray pics = new JSONArray();
+        JSONObject pic = new JSONObject();
+        pic.put("height", height);
+        pic.put("type", 0);
+        pic.put("url", imageUrl);
+        pic.put("width", width);
+        pics.add(pic);
+        imageObj.put("pics", pics);
+        imageContent.put("image", imageObj);
+
+        // 2. Base64编码（对应Python Line 8426-8427）
+        String contentBase64 = java.util.Base64.getEncoder().encodeToString(
+            imageContent.toJSONString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        
+        log.info("【{}】图片内容JSON: {}", cookieId, imageContent.toJSONString());
+        log.info("【{}】Base64编码长度: {}", cookieId, contentBase64.length());
+
+        // 3. 构造消息结构（对应Python Line 8433-8470）
         JSONObject msg = new JSONObject();
-        msg.put("lwp", "/r/ImCore/sendMsg");
+        msg.put("lwp", "/r/MessageSend/sendByReceiverScope");
 
         JSONObject headers = new JSONObject();
         headers.put("mid", XianyuUtils.generateMid());
         msg.put("headers", headers);
 
-        JSONObject body = new JSONObject();
-        body.put("cid", chatId);
-        body.put("toUser", toUserId);
-        body.put("type", "image");
-        body.put("content", imageUrl);
-
-        if (cardId != null) {
-            body.put("card_id", cardId);
-        }
-
+        JSONArray body = new JSONArray();
+        
+        // Body第一部分：消息内容
+        JSONObject bodyPart1 = new JSONObject();
+        bodyPart1.put("uuid", XianyuUtils.generateUuid());
+        bodyPart1.put("cid", chatId + "@goofish");
+        bodyPart1.put("conversationType", 1);
+        
+        JSONObject contentObj = new JSONObject();
+        contentObj.put("contentType", 101);
+        JSONObject custom = new JSONObject();
+        custom.put("type", 1);
+        custom.put("data", contentBase64);
+        contentObj.put("custom", custom);
+        bodyPart1.put("content", contentObj);
+        
+        bodyPart1.put("redPointPolicy", 0);
+        JSONObject extension = new JSONObject();
+        extension.put("extJson", "{}");
+        bodyPart1.put("extension", extension);
+        
+        JSONObject ctx = new JSONObject();
+        ctx.put("appVersion", "1.0");
+        ctx.put("platform", "web");
+        bodyPart1.put("ctx", ctx);
+        
+        bodyPart1.put("mtags", new JSONObject());
+        bodyPart1.put("msgReadStatusSetting", 1);
+        
+        body.add(bodyPart1);
+        
+        // Body第二部分：接收者列表（对应Python Line 8461-8466）
+        JSONObject bodyPart2 = new JSONObject();
+        JSONArray actualReceivers = new JSONArray();
+        actualReceivers.add(toUserId + "@goofish");
+        actualReceivers.add(myId + "@goofish");
+        bodyPart2.put("actualReceivers", actualReceivers);
+        
+        body.add(bodyPart2);
+        
         msg.put("body", body);
 
+        // 4. 发送消息（对应Python Line 8470）
         session.sendMessage(new TextMessage(msg.toJSONString()));
-        log.info("【{}】已发送图片消息到聊天: {}, 图片: {}", cookieId, chatId, imageUrl);
+        log.info("【{}】图片消息发送成功: {}", cookieId, imageUrl);
     }
 
     // ============== 防重复机制方法 ==============
@@ -2826,32 +2962,11 @@ public class XianyuClient extends TextWebSocketHandler {
             }
 
             // ========== 步骤15: 防抖回复调度 ==========
-            // 对应Python: Line 7751-7762
+            // 对应Python: Line 7751-7762 调用 _schedule_debounced_reply
             // 使用防抖机制处理聊天消息回复
             // 如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
-            final String finalSendUserName = sendUserName;
-            final String finalSendUserId = sendUserId;
-            final String finalSendMessage = sendMessage;
-            final String finalItemId = itemId;
-            final String finalChatId = chatId;
-            final String finalMsgTime = msgTime;
-
-            CompletableFuture.runAsync(() -> {
-                try {
-                    // 防抖回复逻辑（简化版 - 实际需实现消息去重和防抖计时器）
-                    // 完整实现需要：
-                    // 1. 提取messageId并去重
-                    // 2. 管理防抖任务Map
-                    // 3. 取消旧任务并调度新任务
-                    // 4. 延迟后调用processChatMessageReply
-
-                    log.info("【{}】防抖回复调度已启动: chatId={}, 用户={}, 消息={}",
-                            cookieId, finalChatId, finalSendUserName, finalSendMessage);
-
-                } catch (Exception e) {
-                    log.error("【{}】防抖回复调度失败", cookieId, e);
-                }
-            }, scheduledExecutor);
+            scheduleDebouncedReply(chatId, message, session, sendUserName, sendUserId,
+                    sendMessage, itemId, msgTime);
 
             log.debug("【{}】消息处理完成（阶段3 - 全部15个步骤）", cookieId);
 
@@ -2931,6 +3046,59 @@ public class XianyuClient extends TextWebSocketHandler {
             log.error("【{}】解密消息过程异常: {}", cookieId, e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * 从消息数据中提取消息ID，用于去重
+     * 对应Python: _extract_message_id (Line 6932-6974)
+     *
+     * @param messageData 原始消息数据
+     * @return 消息ID字符串，如果无法提取则返回null
+     */
+    private String extractMessageId(JSONObject messageData) {
+        try {
+            // 尝试从 message['1']['10']['bizTag'] 中提取 messageId
+            if (messageData.containsKey("1") && messageData.get("1") instanceof JSONObject) {
+                JSONObject message1 = messageData.getJSONObject("1");
+                if (message1.containsKey("10") && message1.get("10") instanceof JSONObject) {
+                    JSONObject message10 = message1.getJSONObject("10");
+                    
+                    // 尝试从 bizTag 提取
+                    if (message10.containsKey("bizTag")) {
+                        String bizTag = message10.getString("bizTag");
+                        if (bizTag != null && !bizTag.isEmpty()) {
+                            try {
+                                JSONObject bizTagDict = JSON.parseObject(bizTag);
+                                if (bizTagDict.containsKey("messageId")) {
+                                    return bizTagDict.getString("messageId");
+                                }
+                            } catch (Exception е) {
+                                // bizTag 解析失败，继续尝试其他方式
+                            }
+                        }
+                    }
+                    
+                    // 如果 bizTag 解析失败，尝试从 extJson 中提取
+                    if (message10.containsKey("extJson")) {
+                        String extJson = message10.getString("extJson");
+                        if (extJson != null && !extJson.isEmpty()) {
+                            try {
+                                JSONObject extJsonDict = JSON.parseObject(extJson);
+                                if (extJsonDict.containsKey("messageId")) {
+                                    return extJsonDict.getString("messageId");
+                                }
+                            } catch (Exception е) {
+                                // extJson 解析失败
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("【{}】提取消息ID失败: {}", cookieId, e.getMessage());
+        }
+        
+        return null;
     }
 
     /**
@@ -3118,6 +3286,419 @@ public class XianyuClient extends TextWebSocketHandler {
 
         return null;
     }
+
+       // ============== 防抖回复调度逻辑 ==============
+
+    /**
+     * 调度防抖回复：如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
+     * 对应Python: _schedule_debounced_reply (Line 6976-7122)
+     *
+     * @param chatId       聊天ID
+     * @param messageData  原始消息数据
+     * @param session      WebSocket会话
+     * @param sendUserName 发送者用户名
+     * @param sendUserId   发送者用户ID
+     * @param sendMessage  消息内容
+     * @param itemId       商品ID
+     * @param msgTime      消息时间
+     */
+    private void scheduleDebouncedReply(String chatId, JSONObject messageData, WebSocketSession session,
+                                      String sendUserName, String sendUserId, String sendMessage,
+                                      String itemId, String msgTime) {
+        // 提取消息ID并检查是否已处理
+        String messageId = extractMessageId(messageData);
+        
+        // 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
+        if (messageId == null || messageId.isEmpty()) {
+            try {
+                // 尝试从消息数据中提取时间戳
+                long createTime = 0;
+                if (messageData.containsKey("1") && messageData.get("1") instanceof JSONObject) {
+                    JSONObject message1 = messageData.getJSONObject("1");
+                    createTime = message1.getLongValue("5");
+                }
+                // 使用组合键作为备用标识
+                messageId = chatId + "_" + sendMessage + "_" + createTime;
+            } catch (Exception е) {
+                // 如果提取失败，使用当前时间戳
+                messageId = chatId + "_" + sendMessage + "_" + System.currentTimeMillis();
+            }
+        }
+        
+        // 使用锁保护消息ID去重检查和更新
+        final String finalMessageId = messageId;
+        processedMessageIdsLock.lock();
+        try {
+            long currentTime = System.currentTimeMillis() / 1000; // 转换为秒
+            
+            // 检查消息是否已处理且未过期
+            if (processedMessageIds.containsKey(finalMessageId)) {
+                long lastProcessTime = processedMessageIds.get(finalMessageId);
+                long timeElapsed = currentTime - lastProcessTime;
+                
+                // 如果消息处理时间未超过1小时，跳过
+                if (timeElapsed < MESSAGE_EXPIRE_TIME) {
+                    long remainingTime = MESSAGE_EXPIRE_TIME - timeElapsed;
+                    log.warn("【{}】消息ID {}... 已处理过，距离可重复回复还需 {} 秒",
+                            cookieId,
+                            finalMessageId.length() > 50 ? finalMessageId.substring(0, 50) : finalMessageId,
+                            remainingTime);
+                    return;
+                } else {
+                    // 超过1小时，可以重新处理
+                    log.info("【{}】消息ID {}... 已超过 {} 分钟，允许重新回复",
+                            cookieId,
+                            finalMessageId.length() > 50 ? finalMessageId.substring(0, 50) : finalMessageId,
+                            (int) (timeElapsed / 60));
+                }
+            }
+            
+            // 标记消息ID为已处理（更新或添加时间戳）
+            processedMessageIds.put(finalMessageId, currentTime);
+            
+            // 定期清理过期的消息ID
+            if (processedMessageIds.size() > PROCESSED_MESSAGE_IDS_MAX_SIZE) {
+                // 清理超过1小时的旧记录
+                java.util.List<String> expiredIds = new java.util.ArrayList<>();
+                for (Map.Entry<String, Long> entry : processedMessageIds.entrySet()) {
+                    if (currentTime - entry.getValue() > MESSAGE_EXPIRE_TIME) {
+                        expiredIds.add(entry.getKey());
+                    }
+                }
+                
+                for (String msgId : expiredIds) {
+                    processedMessageIds.remove(msgId);
+                }
+                
+                log.info("【{}】已清理 {} 个过期消息ID", cookieId, expiredIds.size());
+                
+                // 如果清理后仍然过大，删除最旧的一半
+                if (processedMessageIds.size() > PROCESSED_MESSAGE_IDS_MAX_SIZE) {
+                    java.util.List<Map.Entry<String, Long>> sortedIds = new java.util.ArrayList<>(processedMessageIds.entrySet());
+                    sortedIds.sort(Map.Entry.comparingByValue());
+                    int removeCount = sortedIds.size() / 2;
+                    for (int i = 0; i < removeCount; i++) {
+                        processedMessageIds.remove(sortedIds.get(i).getKey());
+                    }
+                    log.info("【{}】消息ID去重字典过大，已清理 {} 个最旧记录", cookieId, removeCount);
+                }
+            }
+        } finally {
+            processedMessageIdsLock.unlock();
+        }
+        
+        // 使用防抖锁管理防抖任务
+        messageDebounceLock.lock();
+        try {
+            // 如果该chat_id已有防抖任务，取消它
+            if (messageDebounceTasks.containsKey(chatId)) {
+                MessageDebounceInfo oldInfo = messageDebounceTasks.get(chatId);
+                if (oldInfo != null && oldInfo.task != null && !oldInfo.task.isDone()) {
+                    oldInfo.task.cancel(true);
+                    log.warn("【{}】取消chat_id {} 的旧防抖任务", cookieId, chatId);
+                }
+            }
+            
+            // 更新最后一条消息信息
+            long currentTimer = System.currentTimeMillis();
+            JSONObject lastMessage = new JSONObject();
+            lastMessage.put("message_data", messageData);
+            lastMessage.put("send_user_name", sendUserName);
+            lastMessage.put("send_user_id", sendUserId);
+            lastMessage.put("send_message", sendMessage);
+            lastMessage.put("item_id", itemId);
+            lastMessage.put("msg_time", msgTime);
+            
+            // 保存session引用（不放入JSONObject）
+            final WebSocketSession finalSession = session;
+            
+            // 创建新的防抖任务
+            CompletableFuture<Void> debounceTask = CompletableFuture.runAsync(() -> {
+                long savedTimer = currentTimer; // 保存创建任务时的时间戳
+                try {
+                    // 等待防抖延迟时间
+                    Thread.sleep(MESSAGE_DEBOUNCE_DELAY * 1000L);
+                    
+                    // 检查是否仍然是最新的消息（防止在等待期间有新消息）
+                    messageDebounceLock.lock();
+                    try {
+                        if (!messageDebounceTasks.containsKey(chatId)) {
+                            return;
+                        }
+                        
+                        MessageDebounceInfo debounceInfo = messageDebounceTasks.get(chatId);
+                        // 检查时间戳是否匹配（确保这是最新的消息）
+                        if (savedTimer != debounceInfo.timer) {
+                            log.warn("【{}】chat_id {} 在防抖期间有新消息，跳过旧消息处理", cookieId, chatId);
+                            return;
+                        }
+                        
+                        // 从防抖任务中移除
+                        messageDebounceTasks.remove(chatId);
+                    } finally {
+                        messageDebounceLock.unlock();
+                    }
+                    
+                    // 处理最后一条消息
+                    log.info("【{}】防抖延迟结束，开始处理chat_id {} 的最后一条消息: {}...",
+                            cookieId, chatId,
+                            sendMessage.length() > 30 ? sendMessage.substring(0, 30) : sendMessage);
+                    
+                    // 调用实际的回复处理方法
+                    processChatMessageReply(messageData, finalSession, sendUserName, sendUserId,
+                            sendMessage, itemId, chatId, msgTime);
+                    
+                } catch (InterruptedException е) {
+                    log.warn("【{}】chat_id {} 的防抖任务被取消", cookieId, chatId);
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    log.error("【{}】处理防抖回复时发生错误: {}", cookieId, e.getMessage(), e);
+                    // 确保从防抖任务中移除
+                    messageDebounceLock.lock();
+                    try {
+                        messageDebounceTasks.remove(chatId);
+                    } finally {
+                        messageDebounceLock.unlock();
+                    }
+                }
+            }, scheduledExecutor);
+            
+            // 创建防抖信息对象并存储
+            MessageDebounceInfo debounceInfo = new MessageDebounceInfo(debounceTask, lastMessage, currentTimer);
+            messageDebounceTasks.put(chatId, debounceInfo);
+            
+            log.warn("【{}】为chat_id {} 创建防抖任务，延迟 {} 秒", cookieId, chatId, MESSAGE_DEBOUNCE_DELAY);
+            
+        } finally {
+            messageDebounceLock.unlock();
+        }
+    }
+
+    /**
+     * 处理聊天消息的回复逻辑（从handleMessage中提取出来的核心回复逻辑）
+     * 对应Python: _process_chat_message_reply (Line 7123-7300)
+     *
+     * @param messageData  原始消息数据
+     * @param session      WebSocket会话
+     * @param sendUserName 发送者用户名
+     * @param sendUserId   发送者用户ID
+     * @param sendMessage  消息内容
+     * @param itemId       商品ID
+     * @param chatId       聊天ID
+     * @param msgTime      消息时间
+     */
+    private void processChatMessageReply(JSONObject messageData, WebSocketSession session,
+                                         String sendUserName, String sendUserId, String sendMessage,
+                                         String itemId, String chatId, String msgTime) {
+        try {
+            // 检查自动回复是否启用
+            // 对应Python: Line 7140-7143
+            // 注意：这里从replyService获取配置，实际应该统一管理配置
+            // Python中是从 AUTO_REPLY.get('enabled', True) 读取
+            boolean autoReplyEnabled = true; // 默认启用，实际应该从配置读取
+            if (!autoReplyEnabled) {
+                log.info("[{}] 【{}】【系统】自动回复已禁用", msgTime, cookieId);
+                return;
+            }
+
+            // 检查该chat_id是否处于暂停状态
+            // 对应Python: Line 7145-7151
+            if (pauseManager.isChatPaused(chatId)) {
+                long remainingTime = pauseManager.getRemainingPauseTime(chatId);
+                long remainingMinutes = remainingTime / 60;
+                long remainingSeconds = remainingTime % 60;
+                log.info("[{}] 【{}】【系统】chat_id {} 自动回复已暂停，剩余时间: {}分{}秒",
+                        msgTime, cookieId, chatId, remainingMinutes, remainingSeconds);
+                return;
+            }
+
+            // 构造用户URL
+            // 对应Python: Line 7153-7154
+            String userUrl = "https://www.goofish.com/personal?userId=" + sendUserId;
+
+            String reply = null;
+            String replySource = "API"; // 默认假设是API回复
+
+            // ========== 回复策略优先级处理 ==========
+            // 对应Python: Line 7156-7266
+            
+            // 1. 判断是否启用API回复
+            // 对应Python: Line 7158-7164
+            boolean apiEnabled = false; // 实际应该从配置读取: AUTO_REPLY.get('api', {}).get('enabled', False)
+            if (apiEnabled) {
+                try {
+                    reply = replyService.getApiReply(msgTime, userUrl, sendUserId, sendUserName,
+                            itemId, sendMessage, chatId);
+                    if (reply == null || reply.isEmpty()) {
+                        log.error("[{}] 【API调用失败】用户: {} (ID: {}), 商品({}): {}",
+                                msgTime, sendUserName, sendUserId, itemId, sendMessage);
+                    }
+                } catch (Exception e) {
+                    log.error("[{}] 【API调用异常】用户: {} (ID: {}), 商品({}): {}, 错误: {}",
+                            msgTime, sendUserName, sendUserId, itemId, sendMessage, e.getMessage());
+                }
+            }
+
+            // 如果API回复失败或未启用API，按新的优先级顺序处理
+            // 对应Python: Line 7169-7266
+            if (reply == null || reply.isEmpty()) {
+                // 2. 首先尝试关键词匹配（传入商品ID）
+                // 对应Python: Line 7171-7178
+                try {
+                    reply = replyService.getKeywordReply(sendUserName, sendUserId, sendMessage, itemId);
+                    if ("EMPTY_REPLY".equals(reply)) {
+                        // 匹配到关键词但回复内容为空，不进行任何回复
+                        log.info("[{}] 【{}】匹配到空回复关键词，跳过自动回复", msgTime, cookieId);
+                        return;
+                    } else if (reply != null && !reply.isEmpty()) {
+                        replySource = "关键词"; // 标记为关键词回复
+                    }
+                } catch (Exception e) {
+                    log.error("【{}】关键词回复获取失败: {}", cookieId, e.getMessage());
+                    reply = null;
+                }
+
+                // 3. 关键词匹配失败，如果AI开关打开，尝试AI回复
+                // 对应Python: Line 7179-7183
+                if (reply == null || reply.isEmpty()) {
+                    try {
+                        reply = replyService.getAiReply(sendUserName, sendUserId, sendMessage, itemId, chatId);
+                        if (reply != null && !reply.isEmpty()) {
+                            replySource = "AI"; // 标记为AI回复
+                        }
+                    } catch (Exception e) {
+                        log.error("【{}】AI回复获取失败: {}", cookieId, e.getMessage());
+                        reply = null;
+                    }
+
+                    // 4. 最后使用默认回复
+                    // 对应Python: Line 7184-7266
+                    if (reply == null || reply.isEmpty()) {
+                        try {
+                            Object defaultReplyResult = replyService.getDefaultReply(sendUserName, sendUserId,
+                                    sendMessage, chatId, itemId);
+                            
+                            if ("EMPTY_REPLY".equals(defaultReplyResult)) {
+                                // 默认回复内容为空，不进行任何回复
+                                log.info("[{}] 【{}】默认回复内容为空，跳过自动回复", msgTime, cookieId);
+                                return;
+                            }
+                            
+                            // 处理默认回复（可能包含图片和文字）
+                            // 对应Python: Line 7192-7266
+                            if (defaultReplyResult instanceof Map) {
+                                @SuppressWarnings("unchecked")
+                                Map<String, Object> defaultReplyMap = (Map<String, Object>) defaultReplyResult;
+                                replySource = "默认"; // 标记为默认回复
+                                
+                                String defaultImageUrl = (String) defaultReplyMap.get("image_url");
+                                String defaultText = (String) defaultReplyMap.get("text");
+                                
+                                // 如果存在图片，先发送图片
+                                // 对应Python: Line 7198-7255
+                                if (defaultImageUrl != null && !defaultImageUrl.isEmpty()) {
+                                    try {
+                                        // Python中有复杂的图片处理逻辑（CDN检查、上传、尺寸获取）
+                                        // Java中简化实现：直接使用图片URL
+                                        String finalImageUrl = defaultImageUrl;
+                                        int imageWidth = 800;  // 默认尺寸
+                                        int imageHeight = 600; // 默认尺寸
+                                        
+                                        // 可以从配置或replyService获取图片尺寸
+                                        // 这里简化为使用默认值
+                                        
+                                        // 发送图片
+                                        if (finalImageUrl != null && !finalImageUrl.isEmpty()) {
+                                            sendImageMsg(session, chatId, sendUserId, finalImageUrl, null);
+                                            msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                                                    .format(new java.util.Date());
+                                            log.info("[{}] 【{}图片发出】用户: {} (ID: {}), 商品({}): 图片 {}",
+                                                    msgTime, replySource, sendUserName, sendUserId, itemId, finalImageUrl);
+                                        }
+                                    } catch (Exception e) {
+                                        log.error("【{}】默认回复图片发送失败: {}", cookieId, e.getMessage());
+                                    }
+                                }
+                                
+                                // 然后发送文字（如果有）
+                                // 对应Python: Line 7257-7264
+                                if (defaultText != null && !defaultText.trim().isEmpty()) {
+                                    reply = defaultText;
+                                } else {
+                                    // 只有图片没有文字，已经发送完毕
+                                    if (defaultImageUrl != null && !defaultImageUrl.isEmpty()) {
+                                        return;
+                                    }
+                                    reply = null;
+                                }
+                            } else if (defaultReplyResult instanceof String) {
+                                // 字符串类型的默认回复
+                                reply = (String) defaultReplyResult;
+                                replySource = "默认";
+                            } else {
+                                reply = null;
+                            }
+                        } catch (Exception e) {
+                            log.error("【{}】默认回复获取失败: {}", cookieId, e.getMessage());
+                            reply = null;
+                        }
+                    }
+                }
+            }
+
+            // 注意：这里只有商品ID，没有标题和详情，根据新的规则不保存到数据库
+            // 商品信息会在其他有完整信息的地方保存（如发货规则匹配时）
+            // 消息通知已在收到消息时立即发送，此处不再重复发送
+            // 对应Python: Line 7268-7270
+
+            // 如果有回复内容，发送消息
+            // 对应Python: Line 7272-7298
+            if (reply != null && !reply.isEmpty()) {
+                // 检查是否是图片发送标记
+                // 对应Python: Line 7274-7289
+                if (reply.startsWith("__IMAGE_SEND__")) {
+                    // 提取图片URL（关键词回复不包含卡券ID）
+                    String imageUrl = reply.replace("__IMAGE_SEND__", "");
+                    // 发送图片消息
+                    try {
+                        sendImageMsg(session, chatId, sendUserId, imageUrl, null);
+                        // 记录发出的图片消息
+                        msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                                .format(new java.util.Date());
+                        log.info("[{}] 【{}图片发出】用户: {} (ID: {}), 商品({}): 图片 {}",
+                                msgTime, replySource, sendUserName, sendUserId, itemId, imageUrl);
+                    } catch (Exception e) {
+                        // 图片发送失败，发送错误提示
+                        log.error("【{}】图片发送失败: {}", cookieId, e.getMessage());
+                        sendMsg(session, chatId, sendUserId, "抱歉，图片发送失败，请稍后重试。");
+                        msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                                .format(new java.util.Date());
+                        log.error("[{}] 【{}图片发送失败】用户: {} (ID: {}), 商品({})",
+                                msgTime, replySource, sendUserName, sendUserId, itemId);
+                    }
+                } else {
+                    // 普通文本消息
+                    // 对应Python: Line 7290-7295
+                    sendMsg(session, chatId, sendUserId, reply);
+                    // 记录发出的消息
+                    msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                            .format(new java.util.Date());
+                    log.info("[{}] 【{}发出】用户: {} (ID: {}), 商品({}): {}",
+                            msgTime, replySource, sendUserName, sendUserId, itemId, reply);
+                }
+            } else {
+                // 对应Python: Line 7296-7298
+                msgTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                        .format(new java.util.Date());
+                log.info("[{}] 【{}】【系统】未找到匹配的回复规则，不回复", msgTime, cookieId);
+            }
+        } catch (Exception e) {
+            // 对应Python: Line 7299-7300
+            log.error("【{}】处理聊天消息回复时发生错误: {}", cookieId, e.getMessage(), e);
+        }
+    }
+
+    // ============== 消息处理主逻辑 ==============
 
     /**
      * 统一处理自动发货逻辑

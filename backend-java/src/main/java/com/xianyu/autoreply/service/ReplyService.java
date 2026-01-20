@@ -206,5 +206,77 @@ public class ReplyService {
         }
         return null;
     }
-}
 
+    // ========== 以下方法供 XianyuClient.processChatMessageReply 使用 ==========
+
+    /**
+     * 获取API回复
+     * 对应Python: get_api_reply
+     */
+    public String getApiReply(String msgTime, String userUrl, String sendUserId,
+                              String sendUserName, String itemId, String sendMessage, String chatId) {
+        // 简化实现：实际应该调用外部API
+        // Python中从 AUTO_REPLY.get('api', {}).get('url') 获取API地址
+        log.debug("【API回复】暂未实现，返回null");
+        return null;
+    }
+
+    /**
+     * 获取关键词回复
+     * 对应Python: get_keyword_reply
+     *
+     * @return 回复内容，或 "EMPTY_REPLY" 表示匹配到但不回复，或 null 表示未匹配
+     */
+    public String getKeywordReply(String sendUserName, String sendUserId,
+                                  String sendMessage, String itemId) {
+        try {
+            // 这里应该查询关键词库并匹配
+            // 简化实现：调用现有的determineReply逻辑
+            // 实际应该单独实现关键词匹配逻辑
+            log.debug("【关键词回复】暂使用简化实现");
+            return null;
+        } catch (Exception e) {
+            log.error("关键词回复查询失败", e);
+            return null;
+        }
+    }
+
+    /**
+     * 获取AI回复
+     * 对应Python: get_ai_reply
+     */
+    public String getAiReply(String sendUserName, String sendUserId,
+                             String sendMessage, String itemId, String chatId) {
+        try {
+            // 调用AI回复服务
+            return aiReplyService.generateReply(null, chatId, sendUserId, itemId, sendMessage);
+        } catch (Exception e) {
+            log.error("AI回复生成失败", e);
+            return null;
+        }
+    }
+
+    /**
+     * 获取默认回复
+     * 对应Python: get_default_reply
+     *
+     * @return String (纯文字回复) 或 Map&lt;String, Object&gt; (包含image_url/text) 或 "EMPTY_REPLY"
+     */
+    public Object getDefaultReply(String sendUserName, String sendUserId,
+                                  String sendMessage, String chatId, String itemId) {
+        try {
+            // 查询默认回复配置
+            // Python中返回可能是：
+            // 1. "EMPTY_REPLY" - 表示不回复
+            // 2. dict with 'image_url' and 'text' - 图片+文字回复
+            // 3. String - 纯文字回复
+            
+            // 简化实现：返回null表示无默认回复
+            log.debug("【默认回复】暂使用简化实现");
+            return null;
+        } catch (Exception e) {
+            log.error("默认回复查询失败", e);
+            return null;
+        }
+    }
+}
